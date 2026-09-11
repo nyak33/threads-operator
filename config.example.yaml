@@ -1,0 +1,19 @@
+execution_mode: approval_required
+insights:
+  account_sample_minutes: 15
+  post_sampling:
+    - max_age_minutes: 120
+      interval_minutes: 5
+    - max_age_minutes: 360
+      interval_minutes: 15
+    - max_age_minutes: 1440
+      interval_minutes: 30
+    - max_age_minutes: 4320
+      interval_minutes: 60
+    - max_age_minutes: 10080
+      interval_minutes: 360
+    - max_age_minutes: null
+      interval_minutes: 1440
+whatsapp:
+  prefilled_message: "Hi, saya datang dari Threads."
+  phone_number: "replace_me"
