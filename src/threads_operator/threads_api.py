@@ -95,20 +95,41 @@ class ThreadsAPI:
             _merge_metric_payload(result, response.json())
             return result
 
+        if not _is_metric_availability_error(response):
+            response.raise_for_status()
+
         # Some post types/accounts may reject a combined request when one metric
         # is unavailable. Retry individually so unsupported metrics stay unknown
-        # instead of losing the entire snapshot. Authentication/rate failures
-        # still surface immediately.
+        # instead of losing the entire snapshot. Authentication and other
+        # non-metric request failures are surfaced immediately.
         for metric in metric_names:
             single = self.client.get(
                 url,
                 params=self._params({"metric": metric}),
             )
-            if single.status_code == 400:
+            if single.status_code == 400 and _is_metric_availability_error(single):
                 continue
             single.raise_for_status()
             _merge_metric_payload(result, single.json())
         return result
+
+
+def _is_metric_availability_error(response: httpx.Response) -> bool:
+    """Return True only for 400 responses that specifically concern metrics."""
+    if response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    error_type = str(error.get("type", "")).lower()
+    if "oauth" in error_type:
+        return False
+    message = str(error.get("message", "")).lower()
+    return "metric" in message
 
 
 def _merge_metric_payload(
@@ -124,9 +145,14 @@ def _extract_scalar_value(item: dict[str, Any]) -> int | float | None:
     values = item.get("values")
     candidate: Any = None
     if isinstance(values, list) and values:
-        first = values[0]
-        if isinstance(first, dict):
-            candidate = first.get("value")
+        dict_values = [value for value in values if isinstance(value, dict)]
+        if dict_values:
+            dated_values = [value for value in dict_values if value.get("end_time")]
+            if dated_values:
+                selected = max(dated_values, key=lambda value: str(value["end_time"]))
+            else:
+                selected = dict_values[-1]
+            candidate = selected.get("value")
     if candidate is None:
         total_value = item.get("total_value")
         if isinstance(total_value, dict):
