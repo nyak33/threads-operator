@@ -1,6 +1,7 @@
 import json
 
 import httpx
+import pytest
 
 from threads_operator.threads_api import ThreadsAPI
 
@@ -93,6 +94,27 @@ def test_account_insights_parse_supported_metrics():
     assert metrics["clicks"] == 12
 
 
+def test_account_insights_uses_latest_dated_value():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "name": "views",
+                        "values": [
+                            {"value": 100, "end_time": "2026-09-09T07:00:00+0000"},
+                            {"value": 175, "end_time": "2026-09-10T07:00:00+0000"},
+                        ],
+                    }
+                ]
+            },
+        )
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    assert api.get_account_insights()["views"] == 175
+
+
 def test_non_scalar_metric_is_left_unknown():
     def handler(request):
         return httpx.Response(
@@ -126,3 +148,21 @@ def test_metric_request_falls_back_individually_when_combined_request_is_rejecte
     assert metrics["shares"] is None
     assert calls[0].count(",") >= 1
     assert "views" in calls[1:]
+
+
+def test_oauth_400_is_not_silently_treated_as_missing_metrics():
+    def handler(request):
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Invalid OAuth access token.",
+                    "type": "OAuthException",
+                    "code": 190,
+                }
+            },
+        )
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        api.get_post_insights("post-1")
