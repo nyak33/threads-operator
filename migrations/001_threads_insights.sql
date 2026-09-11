@@ -60,6 +60,13 @@ create table if not exists threads_daily_rollups (
     primary key (date, account_id)
 );
 
+-- SQL-created tables in Supabase do not automatically gain the same RLS
+-- protection as tables created through the dashboard. Keep these private by
+-- default; the server-side service-role collector can still access them.
+alter table threads_account_snapshots enable row level security;
+alter table threads_post_snapshots enable row level security;
+alter table threads_daily_rollups enable row level security;
+
 comment on table threads_account_snapshots is
     'Append-only raw account Insights snapshots. Do not overwrite historical rows.';
 comment on table threads_post_snapshots is
