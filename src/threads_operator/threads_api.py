@@ -19,6 +19,11 @@ ACCOUNT_METRICS = (
 )
 
 
+def has_usable_metrics(row: dict[str, Any]) -> bool:
+    """Return True when at least one core post metric is present, including zero."""
+    return any(row.get(name) is not None for name in POST_METRICS)
+
+
 class ThreadsAPI:
     def __init__(
         self,

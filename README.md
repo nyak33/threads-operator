@@ -15,7 +15,7 @@ Raw snapshots are append-only. `threads_daily_rollups` is intentionally rebuilda
 
 ### Setup
 
-1. Apply `migrations/001_threads_insights.sql` to the target Postgres/Supabase project.
+1. Apply `migrations/001_threads_insights.sql`, then `migrations/001b_threads_insights_snapshots.sql`, to the target Postgres/Supabase project. The `001b` migration creates the collision-safe `threads_account_insights_snapshots` and `threads_post_insights_snapshots` tables used by the collector.
 2. Copy `.env.example` to `.env` and fill values locally. Never commit `.env`.
 3. Install the package:
 
@@ -30,6 +30,14 @@ python scripts/collect_insights.py
 ```
 
 The command prints a compact JSON summary and never prints credentials.
+
+### Collector behavior
+
+- Recent post freshness is loaded in batched Supabase reads instead of one lookup per post.
+- The batch window is 25 hours, covering the longest 24-hour sampling interval.
+- Historical snapshots where all six core post metrics are `NULL` are ignored for freshness.
+- A new all-`NULL` post insight response is not stored and does not count as a failure; the post remains eligible for a later retry.
+- Partial metric responses remain valid and preserve unavailable fields as `NULL`. A measured zero remains a valid value.
 
 ### Recommended scheduler
 

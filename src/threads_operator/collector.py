@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import sys
 from typing import Any
 
 from .insights import sample_interval_minutes
-from .threads_api import ACCOUNT_METRICS, POST_METRICS
+from .threads_api import ACCOUNT_METRICS, POST_METRICS, has_usable_metrics
 
 
 def collect_once(
@@ -30,6 +31,7 @@ def collect_once(
         "account_failure": None,
         "posts_sampled": 0,
         "posts_skipped": 0,
+        "posts_all_null": 0,
         "post_failures": [],
     }
 
@@ -43,6 +45,9 @@ def collect_once(
     )
 
     posts = api.list_posts(limit=post_limit)
+    freshness_cutoff = (now - timedelta(hours=25)).isoformat()
+    latest_by_post = store.latest_post_snapshots(freshness_cutoff)
+
     for post in posts:
         post_id = post.get("id")
         if not post_id:
@@ -52,7 +57,7 @@ def collect_once(
         published_at = _parse_datetime(post.get("timestamp"))
         age_minutes = _age_minutes(now, published_at)
         interval = sample_interval_minutes(age_minutes)
-        latest = store.latest_post_snapshot(post_id)
+        latest = latest_by_post.get(post_id)
         if latest and not _is_due(now, latest.get("captured_at"), interval):
             summary["posts_skipped"] += 1
             continue
@@ -68,6 +73,14 @@ def collect_once(
             }
             for name in POST_METRICS:
                 payload[name] = metrics.get(name)
+            if not has_usable_metrics(payload):
+                summary["posts_all_null"] += 1
+                print(
+                    f"warn: all-NULL insights response for post {post_id}; "
+                    "snapshot not stored, will retry next cycle",
+                    file=sys.stderr,
+                )
+                continue
             store.insert_post_snapshot(payload)
             summary["posts_sampled"] += 1
         except Exception as exc:  # isolate one post from the rest of the run

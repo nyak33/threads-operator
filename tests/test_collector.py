@@ -37,9 +37,11 @@ class FakeStore:
         self.latest_account = latest_account
         self.account_rows = []
         self.post_rows = []
+        self.batch_calls = []
 
-    def latest_post_snapshot(self, post_id):
-        return self.latest_posts.get(post_id)
+    def latest_post_snapshots(self, captured_since):
+        self.batch_calls.append(captured_since)
+        return self.latest_posts
 
     def latest_account_snapshot(self, account_id):
         return self.latest_account
@@ -63,6 +65,7 @@ def test_fresh_post_without_history_is_sampled():
 
     assert result["posts_sampled"] == 1
     assert result["posts_skipped"] == 0
+    assert result["posts_all_null"] == 0
     assert store.post_rows[0]["post_id"] == "p1"
     assert store.post_rows[0]["account_id"] == "user-123"
     assert store.post_rows[0]["post_age_minutes"] == 30.0
@@ -73,7 +76,7 @@ def test_fresh_post_without_history_is_sampled():
 def test_post_sampled_too_recently_is_skipped():
     api = FakeAPI([post()])
     store = FakeStore(
-        latest_posts={"p1": {"captured_at": "2026-09-09T08:58:00+00:00"}}
+        latest_posts={"p1": {"captured_at": "2026-09-09T08:58:00+00:00", "views": 1}}
     )
 
     result = collect_once(api, store, NOW)
@@ -99,7 +102,7 @@ def test_one_post_failure_does_not_block_other_post():
 
 
 def test_account_snapshot_respects_default_15_minute_interval():
-    api = FakeAPI([post()])
+    api = FakeAPI([post()], {"p1": {"views": 1}})
     store = FakeStore(latest_account={"captured_at": "2026-09-09T08:50:00+00:00"})
 
     result = collect_once(api, store, NOW)
@@ -117,3 +120,65 @@ def test_account_snapshot_due_after_15_minutes():
 
     assert result["account_snapshot"] == "stored"
     assert store.account_rows[0]["followers_count"] == 100
+
+
+def test_freshness_is_loaded_once_for_multiple_posts():
+    api = FakeAPI([post("p1"), post("p2")])
+    store = FakeStore(
+        latest_posts={
+            "p1": {"captured_at": "2026-09-09T08:58:00+00:00", "views": 1},
+            "p2": {"captured_at": "2026-09-09T08:58:00+00:00", "views": 1},
+        }
+    )
+
+    result = collect_once(api, store, NOW)
+
+    assert result["posts_skipped"] == 2
+    assert len(store.batch_calls) == 1
+    assert api.post_calls == []
+
+
+def test_all_null_metrics_are_not_stored_or_failed():
+    api = FakeAPI([post()], {"p1": {}})
+    store = FakeStore()
+
+    result = collect_once(api, store, NOW)
+
+    assert result["posts_all_null"] == 1
+    assert result["posts_sampled"] == 0
+    assert result["post_failures"] == []
+    assert store.post_rows == []
+
+
+def test_partial_null_metrics_are_stored_without_zero_filling():
+    api = FakeAPI([post()], {"p1": {"views": 10, "likes": None}})
+    store = FakeStore()
+
+    result = collect_once(api, store, NOW)
+
+    assert result["posts_sampled"] == 1
+    assert result["posts_all_null"] == 0
+    assert store.post_rows[0]["views"] == 10
+    assert store.post_rows[0]["likes"] is None
+
+
+def test_zero_metrics_are_usable_and_stored():
+    api = FakeAPI([post()], {"p1": {"views": 0}})
+    store = FakeStore()
+
+    result = collect_once(api, store, NOW)
+
+    assert result["posts_sampled"] == 1
+    assert result["posts_all_null"] == 0
+    assert store.post_rows[0]["views"] == 0
+
+
+def test_all_null_warning_goes_to_stderr(capsys):
+    api = FakeAPI([post()], {"p1": {}})
+    store = FakeStore()
+
+    collect_once(api, store, NOW)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "all-NULL insights response for post p1" in captured.err
