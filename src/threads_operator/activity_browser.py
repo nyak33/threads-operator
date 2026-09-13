@@ -40,25 +40,40 @@ class ActivityReadError(RuntimeError):
     """Reader failed to obtain the Activity payload (no challenge seen)."""
 
 
-def _extract_preloader_payload(document_text: str) -> Any:
-    """Pull the Relay preloader JSON out of the document body.
+def _has_notification_nodes(value: Any) -> bool:
+    """Return True when a parsed preloader result contains notification nodes."""
+    if isinstance(value, dict):
+        notifications = value.get("notifications")
+        if isinstance(notifications, dict):
+            edges = notifications.get("edges")
+            if isinstance(edges, list) and any(
+                isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+                for edge in edges
+            ):
+                return True
+        return any(_has_notification_nodes(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_notification_nodes(item) for item in value)
+    return False
 
-    Brace-matching walk over raw text avoids large JSON dependencies here.
-    """
-    idx = document_text.find(_PRELOADER_KEY)
-    if idx == -1:
-        return None
-    res_idx = document_text.find('"result"', idx)
+
+def _parse_result_object(document_text: str, key_idx: int,
+                         next_key_idx: int) -> Any:
+    """Parse the result object belonging to one preloader-key occurrence."""
+    res_idx = document_text.find('"result"', key_idx, next_key_idx)
     if res_idx == -1:
         return None
-    colon = document_text.find(":", res_idx)
-    start = document_text.find("{", colon)
+    colon = document_text.find(":", res_idx, next_key_idx)
+    if colon == -1:
+        return None
+    start = document_text.find("{", colon, next_key_idx)
     if start == -1:
         return None
+
     depth = 0
     in_str = False
     esc = False
-    for pos in range(start, len(document_text)):
+    for pos in range(start, next_key_idx):
         ch = document_text[pos]
         if in_str:
             if esc:
@@ -82,6 +97,35 @@ def _extract_preloader_payload(document_text: str) -> Any:
                     raise ActivityReadError(
                         f"preloader JSON unparsable: {exc}") from exc
     return None
+
+
+def _extract_preloader_payload(document_text: str) -> Any:
+    """Pull the Activity-feed Relay preloader JSON out of the document body.
+
+    Threads can emit more than one matching preloader block. Some are viewer
+    metadata stubs, so scan each occurrence and return the first parsed result
+    that actually contains notification nodes.
+    """
+    search_from = 0
+    found_key = False
+
+    while True:
+        idx = document_text.find(_PRELOADER_KEY, search_from)
+        if idx == -1:
+            return None
+        found_key = True
+
+        next_idx = document_text.find(_PRELOADER_KEY, idx + len(_PRELOADER_KEY))
+        block_end = next_idx if next_idx != -1 else len(document_text)
+        payload = _parse_result_object(document_text, idx, block_end)
+        if payload is not None and _has_notification_nodes(payload):
+            return payload
+
+        if next_idx == -1:
+            return None
+        search_from = next_idx
+
+    return None if found_key else None
 
 
 async def read_activity_follows(profile_dir: pathlib.Path,
