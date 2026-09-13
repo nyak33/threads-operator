@@ -62,6 +62,12 @@ Example cron entry after installing into the same Python environment:
 
 Use deployment-specific secret injection rather than putting credentials in the cron line.
 
+## Activity follow attribution (optional)
+
+Threads Web exposes `Followed from your post` activity that the official Threads Insights API does not provide as a per-post metric. The optional Activity collector design, verified limitations, matching-confidence rules, browser safety constraints and ready-to-paste Hermes implementation goal are documented in [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md).
+
+Important: Activity exposes the source post **text/snippet**, but not a source post ID/permalink/timestamp. Matching to a known post must therefore preserve uncertainty for repeated content instead of claiming exact attribution when it cannot be proven.
+
 ## Analytics primitives
 
 `threads_operator.insights` currently provides deterministic helpers for:
