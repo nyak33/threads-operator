@@ -68,6 +68,16 @@ Threads Web exposes `Followed from your post` activity that the official Threads
 
 Important: Activity exposes the source post **text/snippet**, but not a source post ID/permalink/timestamp. Matching to a known post must therefore preserve uncertainty for repeated content instead of claiming exact attribution when it cannot be proven.
 
+## Public post-code exact attribution (planned)
+
+Future posts can carry a short first-line marker such as `Day 583`. One shared allocator across all executors reserves the marker before publication, stores its Threads post mapping after publication, and lets the Activity collector validate the marker against both post identity and publication time. Old posts continue using text matching.
+
+Design: [`docs/superpowers/specs/2026-09-14-public-post-code-attribution-design.md`](docs/superpowers/specs/2026-09-14-public-post-code-attribution-design.md)
+
+Implementation plan: [`docs/superpowers/plans/2026-09-14-public-post-code-attribution.md`](docs/superpowers/plans/2026-09-14-public-post-code-attribution.md)
+
+V1 deliberately caps each account at 9,999 unique numeric markers and never recycles a code. Rollover requires a separate design so exact attribution cannot become ambiguous.
+
 ## Analytics primitives
 
 `threads_operator.insights` currently provides deterministic helpers for:
