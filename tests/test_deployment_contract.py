@@ -46,6 +46,18 @@ def test_runtime_account_files_are_gitignored():
     assert ".threads-operator" in text
 
 
+def test_activity_wrappers_route_to_unified_account_aware_cli():
+    shell = (ROOT / "scripts" / "collect_activity_follows.sh").read_text()
+    python_wrapper = (ROOT / "scripts" / "run_activity.py").read_text()
+    module_wrapper = (
+        ROOT / "src" / "threads_operator" / "activity_collector_cli.py"
+    ).read_text()
+
+    assert "threads-operator activity-follow" in shell
+    assert "threads_operator.operator_cli" in python_wrapper
+    assert "operator_cli" in module_wrapper
+
+
 def test_root_operator_docs_exist_and_runbook_covers_portable_flow():
     for name in ("GOAL.md", "RUNBOOK.md", "PROGRESS.md"):
         assert (ROOT / name).is_file()
