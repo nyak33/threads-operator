@@ -17,6 +17,9 @@ class FakeStore:
     def mark_post_main_published(self, table, row_id, post_id):
         self.calls.append(("main", table, row_id, post_id))
 
+    def mark_post_reply_progress(self, table, row_id, reply_ids):
+        self.calls.append(("reply-progress", table, row_id, list(reply_ids)))
+
     def mark_post_posted(self, table, row_id, reply_ids, posted_at=None):
         self.calls.append(("posted", table, row_id, reply_ids))
 
@@ -82,7 +85,7 @@ def test_main_only_publish_claims_before_api_and_marks_posted():
     assert store.calls[2] == ("posted", "queue", 7, [])
 
 
-def test_reply_chain_uses_previous_post_as_parent():
+def test_reply_chain_uses_previous_post_as_parent_and_persists_progress():
     store = FakeStore(row(["reply one", "reply two"]))
     api = FakeAPI(["post-1", "reply-1", "reply-2"])
 
@@ -94,6 +97,11 @@ def test_reply_chain_uses_previous_post_as_parent():
         ("reply two", "reply-1"),
     ]
     assert result["reply_ids"] == ["reply-1", "reply-2"]
+    progress = [call for call in store.calls if call[0] == "reply-progress"]
+    assert progress == [
+        ("reply-progress", "queue", 7, ["reply-1"]),
+        ("reply-progress", "queue", 7, ["reply-1", "reply-2"]),
+    ]
 
 
 def test_failure_after_main_publish_retains_main_id_and_marks_failed():
@@ -110,3 +118,18 @@ def test_failure_after_main_publish_retains_main_id_and_marks_failed():
     failed = [call for call in store.calls if call[0] == "failed"]
     assert len(failed) == 1
     assert "publish exploded" in failed[0][3]
+
+
+def test_failure_after_one_reply_keeps_successful_reply_id_persisted():
+    store = FakeStore(row(["reply one", "reply two"]))
+    api = FakeAPI(["post-1", "reply-1"], fail_at=3)
+
+    result = publish_next(api, store, "queue")
+
+    assert result["status"] == "failed"
+    assert result["main_post_id"] == "post-1"
+    assert result["reply_ids"] == ["reply-1"]
+    assert ("reply-progress", "queue", 7, ["reply-1"]) in store.calls
+    assert store.calls.index(("reply-progress", "queue", 7, ["reply-1"])) < next(
+        index for index, call in enumerate(store.calls) if call[0] == "failed"
+    )
