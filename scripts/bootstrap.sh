@@ -16,7 +16,7 @@ if [[ ! -d "$ROOT_DIR/.venv" ]]; then
     "$PYTHON_BIN" -m venv "$ROOT_DIR/.venv"
 fi
 
-"$ROOT_DIR/.venv/bin/python" -m pip install --upgrade pip
+"$ROOT_DIR/.venv/bin/python" -m pip install --upgrade pip "setuptools>=83"
 "$ROOT_DIR/.venv/bin/python" -m pip install -e "$ROOT_DIR"
 
 mkdir -p "$OPERATOR_HOME/accounts" "$OPERATOR_HOME/browser-profiles"

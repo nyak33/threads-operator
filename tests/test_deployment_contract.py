@@ -20,6 +20,11 @@ def test_bootstrap_script_installs_project_and_creates_runtime_home():
     assert "browser-profiles" in text
 
 
+def test_bootstrap_upgrades_setuptools_past_audited_vulnerability():
+    text = (ROOT / "scripts" / "bootstrap.sh").read_text()
+    assert "setuptools>=83" in text
+
+
 def test_add_account_script_is_secret_safe_and_refuses_overwrite():
     text = (ROOT / "scripts" / "add_account.sh").read_text()
     assert "umask 077" in text

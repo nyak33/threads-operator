@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -25,6 +26,23 @@ def has_usable_metrics(row: dict[str, Any]) -> bool:
     return any(row.get(name) is not None for name in POST_METRICS)
 
 
+def _validate_base_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Threads API base URL must use the official Threads API") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "graph.threads.net"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        raise ValueError("Threads API base URL must use the official Threads API")
+    return base_url.rstrip("/")
+
+
 class ThreadsAPI:
     def __init__(
         self,
@@ -39,7 +57,7 @@ class ThreadsAPI:
             raise ValueError("Threads user id is required")
         self.access_token = access_token
         self.user_id = user_id
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _validate_base_url(base_url)
         self.client = client or httpx.Client(timeout=30)
 
     def _params(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
