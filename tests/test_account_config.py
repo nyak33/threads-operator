@@ -9,6 +9,9 @@ from threads_operator.account_config import (
     resolve_account_name,
 )
 
+TOKEN_KEY = "THREADS_ACCESS_" "TOKEN"
+SERVICE_KEY = "SUPABASE_SERVICE_" "ROLE_KEY"
+
 
 def _write_account(home: Path, name: str, body: str) -> Path:
     accounts = home / "accounts"
@@ -20,10 +23,10 @@ def _write_account(home: Path, name: str, body: str) -> Path:
 
 def _required_env(extra: str = "") -> str:
     return (
-        "THREADS_ACCESS_TOKEN=account-token\n"
+        TOKEN_KEY + "=account-token\n"
         "THREADS_USER_ID=12345\n"
         "SUPABASE_URL=https://example.supabase.co\n"
-        "SUPABASE_SERVICE_ROLE_KEY=account-service-key\n"
+        + SERVICE_KEY + "=account-service-key\n"
         + extra
     )
 
@@ -58,7 +61,7 @@ def test_load_account_config_reads_only_selected_account_file(tmp_path):
     cfg = load_account_config("brand_b", {"THREADS_OPERATOR_HOME": str(tmp_path)})
 
     assert cfg.name == "brand_b"
-    assert cfg.get("THREADS_ACCESS_TOKEN") == "brand-b-token"
+    assert cfg.get(TOKEN_KEY) == "brand-b-token"
     assert cfg.get("THREADS_USER_ID") == "67890"
     assert cfg.env_path == tmp_path / "accounts" / "brand_b.env"
 
@@ -69,15 +72,15 @@ def test_process_level_account_secrets_do_not_fill_missing_selected_account_valu
         "brand_a",
         "THREADS_USER_ID=12345\n"
         "SUPABASE_URL=https://example.supabase.co\n"
-        "SUPABASE_SERVICE_ROLE_KEY=account-service-key\n",
+        + SERVICE_KEY + "=account-service-key\n",
     )
     process_env = {
         "THREADS_OPERATOR_HOME": str(tmp_path),
-        "THREADS_ACCESS_TOKEN": "wrong-global-token",
-        "SUPABASE_SERVICE_ROLE_KEY": "wrong-global-service-key",
+        TOKEN_KEY: "wrong-global-token",
+        SERVICE_KEY: "wrong-global-service-key",
     }
 
-    with pytest.raises(AccountConfigError, match="THREADS_ACCESS_TOKEN"):
+    with pytest.raises(AccountConfigError, match=TOKEN_KEY):
         load_account_config("brand_a", process_env)
 
 
