@@ -19,6 +19,7 @@ from .account_config import (
 from .activity_collector import collect_activity_follows
 from .collector import collect_once
 from .publisher import publish_next
+from .safe_errors import redact_error
 from .supabase_store import SupabaseStore
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
 
@@ -78,6 +79,24 @@ def _store(config: AccountConfig) -> SupabaseStore:
         config.require("SUPABASE_SERVICE_ROLE_KEY"),
         account_key=config.name,
     )
+
+
+def _known_secrets(config: AccountConfig | None) -> list[str]:
+    if config is None:
+        return []
+    return [
+        config.get("THREADS_ACCESS_TOKEN", "") or "",
+        config.get("SUPABASE_SERVICE_ROLE_KEY", "") or "",
+    ]
+
+
+def _sanitize_payload(
+    payload: dict[str, Any], config: AccountConfig | None
+) -> dict[str, Any]:
+    safe = dict(payload)
+    if isinstance(safe.get("error"), str):
+        safe["error"] = redact_error(safe["error"], _known_secrets(config))
+    return safe
 
 
 def _doctor(config: AccountConfig) -> dict[str, Any]:
@@ -207,6 +226,7 @@ def main(
             print(account)
         return 0
 
+    config: AccountConfig | None = None
     try:
         config = _load_selected(getattr(args, "account", None), env)
         if args.command == "doctor":
@@ -222,18 +242,22 @@ def main(
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:
-        print(str(exc), file=sys.stderr)
+        print(redact_error(exc, _known_secrets(config)), file=sys.stderr)
         return 2
     except Exception as exc:
+        safe_error = redact_error(
+            f"{type(exc).__name__}: {exc}", _known_secrets(config)
+        )
         print(
             json.dumps(
-                {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                {"ok": False, "error": safe_error},
                 separators=(",", ":"),
             ),
             file=sys.stderr,
         )
         return 1
 
+    payload = _sanitize_payload(payload, config)
     serialized = json.dumps(payload, separators=(",", ":"))
     if code == 3:
         print(payload.get("error", serialized), file=sys.stderr)
