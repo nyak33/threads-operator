@@ -30,20 +30,22 @@ def test_activity_table_is_append_only_by_privilege_contract():
     assert "collector never updates or deletes" in sql
 
 
-def test_activity_table_dedupes_observation_state_by_fingerprint():
+def test_activity_table_dedupes_observation_state_per_account():
     sql = migration_sql()
-    assert "fallback_fingerprint text not null unique" in sql
+    assert "fallback_fingerprint text not null" in sql
+    assert "unique (account_key, fallback_fingerprint)" in sql
+    assert "account_key text not null" in sql
     assert "notification_id text not null" in sql
     assert "notification_id text not null unique" not in sql
 
 
-def test_summary_is_rebuildable_per_post_latest_state_view():
+def test_summary_is_rebuildable_per_account_and_post_latest_state_view():
     sql = migration_sql()
     assert "create or replace view public.threads_follows_from_post_summary" in sql
     assert "security_invoker" in sql
-    assert "distinct on (notification_id)" in sql
+    assert "distinct on (account_key, notification_id)" in sql
     assert "follows_from_post_activity" in sql
-    assert "group by matched_post_id" in sql
+    assert "group by account_key, matched_post_id" in sql
 
 
 def test_migration_reuses_existing_threads_posts_table():
@@ -81,6 +83,7 @@ def _headers(key: str, prefer: str = "return=minimal") -> dict[str, str]:
 def _event() -> dict:
     token = uuid.uuid4().hex
     return {
+        "account_key": "fixture_account",
         "notification_id": token,
         "notification_datetime": "2026-09-12T10:30:00+00:00",
         "notification_type": "follow",
@@ -96,7 +99,7 @@ def _event() -> dict:
     }
 
 
-def test_live_insert_and_duplicate_fingerprint_rejected(live_db):
+def test_live_insert_and_duplicate_fingerprint_rejected_within_account(live_db):
     evt = _event()
     url = f"{live_db['url']}/rest/v1/{TABLE_EVENTS}"
     with httpx.Client() as client:
