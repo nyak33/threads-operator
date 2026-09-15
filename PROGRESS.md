@@ -18,20 +18,17 @@ Portable multi-account runtime with deterministic draft ingress and production s
 - Official Threads API host validation before credentials can be sent.
 - Forward Supabase privilege-hardening migration.
 - GitHub Actions hardening with read-only permissions, immutable action SHAs, and dependency vulnerability auditing.
+- Bootstrap build-tool hardening to avoid the audited vulnerable setuptools range.
 - Deployment/runbook documentation for shared or separate Supabase layouts.
+- Feature-branch verification: compile succeeded, 136 tests passed with 1 skipped, and dependency audit reported no known vulnerabilities.
 
-## In Progress
+## Deployment Next
 
-- Final branch verification through GitHub Actions.
-- Final PR diff review for regressions, credential leakage, and dependency-audit results.
-
-## Next
-
-1. Require full CI and dependency audit green.
-2. Review the final PR diff.
-3. Merge the verified feature to `main`.
-4. Verify the post-merge `main` workflow.
-5. On a real VPS, supply local account credentials, apply database migrations, establish browser profiles where Activity is required, run `doctor`, then perform read-only/dry-run smoke tests before enabling live posting.
+1. On the target VPS, clone/update the repository and run bootstrap.
+2. Supply local account credentials and apply the forward database migrations, including `006_security_hardening.sql`.
+3. Establish separate browser profiles only where Activity collection is required.
+4. Run `doctor`, Insights validation, Activity dry-run where applicable, and publish dry-run for every account.
+5. Keep live posting disabled until those account-level checks pass.
 6. Optionally configure Hermes-owned content generation per deployment; no LLM key is added to Threads Operator.
 
 ## Deliberately Later / Non-Goals
