@@ -24,4 +24,15 @@ def test_forward_security_migration_revokes_client_roles_from_operator_tables():
         "threads_daily_rollups",
     ):
         assert f"revoke all on table public.{table} from anon, authenticated;" in sql
-        assert f"grant" in sql and f"public.{table}" in sql and "service_role" in sql
+        assert "grant" in sql and f"public.{table}" in sql and "service_role" in sql
+
+
+def test_forward_security_migration_guards_optional_legacy_tables():
+    sql = (ROOT / "migrations" / "006_security_hardening.sql").read_text().lower()
+
+    for table in (
+        "threads_account_snapshots",
+        "threads_post_snapshots",
+    ):
+        assert f"to_regclass('public.{table}')" in sql
+        assert f"public.{table}" in sql
