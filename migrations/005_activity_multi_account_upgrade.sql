@@ -13,6 +13,12 @@ where account_key is null;
 alter table public.threads_activity_events
     alter column account_key set not null;
 
+-- Older Activity schemas referenced an external threads_posts table. The new
+-- operator matches against official API posts, so preserve the ID as text but
+-- remove the portability-breaking foreign key when it exists.
+alter table public.threads_activity_events
+    drop constraint if exists threads_activity_events_matched_post_id_fkey;
+
 alter table public.threads_activity_events
     drop constraint if exists threads_activity_events_fallback_fingerprint_key;
 
