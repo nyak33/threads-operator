@@ -50,14 +50,19 @@ Accounts may point to the same Supabase project or different Supabase projects. 
 
 ## 4. Database Migrations
 
-For a fresh database, apply the repository migrations in filename order that are relevant to the enabled capabilities. At minimum for the current full operator:
+For a fresh database, apply the repository migrations in filename order that are relevant to the enabled capabilities. For the current full operator:
 
 1. `migrations/001_threads_insights.sql`
 2. `migrations/001b_threads_insights_snapshots.sql`
 3. `migrations/003_activity_follow_events.sql` if Activity is enabled
 4. `migrations/004_threads_publish_queue.sql` if queue publishing is enabled
+5. `migrations/005_activity_multi_account_upgrade.sql` may also be applied; it is designed to be harmless when the fresh account-scoped Activity schema already exists.
 
-A deployment that already applied the older single-account Activity migration needs the multi-account upgrade migration documented in this repository before the new Activity writer is enabled. Preserve historical data; do not drop and recreate the Activity table just to upgrade it.
+### Existing single-account Activity database
+
+If the older single-account `003_activity_follow_events.sql` was already applied, run `005_activity_multi_account_upgrade.sql` before enabling the new Activity writer. It preserves the table instead of dropping historical data.
+
+Because an old row contains no operator-local account key, the upgrade temporarily labels historical rows as `legacy`. Before enabling collection, map those historical rows to the correct new local account key if you know which account they belong to. Do not leave `legacy` mixed with new data if you expect one continuous historical series.
 
 ## 5. Browser Session for Activity
 
