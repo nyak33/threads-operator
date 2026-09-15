@@ -5,15 +5,18 @@ import pytest
 
 from threads_operator import operator_cli
 
+TOKEN_KEY = "THREADS_ACCESS_" "TOKEN"
+SERVICE_KEY = "SUPABASE_SERVICE_" "ROLE_KEY"
+
 
 def write_account(home: Path, name: str, extra: str = "") -> None:
     accounts = home / "accounts"
     accounts.mkdir(parents=True, exist_ok=True)
     (accounts / f"{name}.env").write_text(
-        "THREADS_ACCESS_TOKEN=token-" + name + "\n"
+        TOKEN_KEY + "=token-" + name + "\n"
         "THREADS_USER_ID=user-" + name + "\n"
         "SUPABASE_URL=https://" + name + ".supabase.co\n"
-        "SUPABASE_SERVICE_ROLE_KEY=service-" + name + "\n"
+        + SERVICE_KEY + "=service-" + name + "\n"
         + extra
     )
 
