@@ -95,15 +95,17 @@ def test_mark_post_states_remain_account_scoped():
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     store.mark_post_main_published("custom_queue", 7, "post-1")
+    store.mark_post_reply_progress("custom_queue", 7, ["reply-1"])
     store.mark_post_posted("custom_queue", 7, ["reply-1"], posted_at=NOW)
     store.mark_post_failed("custom_queue", 8, "boom")
 
     assert patches[0] == {"threads_main_post_id": "post-1"}
-    assert patches[1]["status"] == "posted"
-    assert patches[1]["threads_reply_ids"] == ["reply-1"]
-    assert patches[1]["posted_at"] == NOW
-    assert patches[1]["last_error"] is None
-    assert patches[2] == {"status": "failed", "last_error": "boom"}
+    assert patches[1] == {"threads_reply_ids": ["reply-1"]}
+    assert patches[2]["status"] == "posted"
+    assert patches[2]["threads_reply_ids"] == ["reply-1"]
+    assert patches[2]["posted_at"] == NOW
+    assert patches[2]["last_error"] is None
+    assert patches[3] == {"status": "failed", "last_error": "boom"}
 
 
 def test_publish_queue_migration_has_account_and_safety_constraints():
