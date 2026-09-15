@@ -50,6 +50,16 @@ def _parser() -> argparse.ArgumentParser:
     activity.add_argument("--dry-run", action="store_true")
     activity.add_argument("--settle", type=float, default=3.0)
 
+    enqueue = sub.add_parser(
+        "enqueue-draft",
+        help="Insert already-generated content into the selected account queue as draft",
+    )
+    enqueue.add_argument("--account")
+    enqueue.add_argument("--text", required=True)
+    enqueue.add_argument("--reply", action="append", default=[])
+    enqueue.add_argument("--campaign-code")
+    enqueue.add_argument("--scheduled-at")
+
     publish = sub.add_parser("publish", help="Publish one approved due queue item")
     publish.add_argument("--account")
     publish.add_argument("--dry-run", action="store_true")
@@ -184,6 +194,31 @@ def _run_activity(
     }
 
 
+def _run_enqueue_draft(
+    config: AccountConfig,
+    *,
+    text: str,
+    replies: list[str],
+    campaign_code: str | None,
+    scheduled_at: str | None,
+) -> tuple[int, dict[str, Any]]:
+    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+    campaign = campaign_code or config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
+    row = _store(config).enqueue_draft(
+        table,
+        text,
+        reply_texts=replies,
+        campaign_code=campaign,
+        scheduled_at=scheduled_at,
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "id": row.get("id"),
+        "status": row.get("status", "draft"),
+    }
+
+
 def _run_publish(
     config: AccountConfig,
     *,
@@ -236,6 +271,14 @@ def main(
         elif args.command == "activity-follow":
             code, payload = _run_activity(
                 config, dry_run=args.dry_run, settle=args.settle
+            )
+        elif args.command == "enqueue-draft":
+            code, payload = _run_enqueue_draft(
+                config,
+                text=args.text,
+                replies=args.reply,
+                campaign_code=args.campaign_code,
+                scheduled_at=args.scheduled_at,
             )
         elif args.command == "publish":
             code, payload = _run_publish(config, dry_run=args.dry_run)
