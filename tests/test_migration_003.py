@@ -48,9 +48,10 @@ def test_summary_is_rebuildable_per_account_and_post_latest_state_view():
     assert "group by account_key, matched_post_id" in sql
 
 
-def test_migration_reuses_existing_threads_posts_table():
+def test_migration_stores_matched_post_id_without_external_posts_dependency():
     sql = migration_sql()
-    assert "references public.threads_posts(thread_id)" in sql
+    assert "matched_post_id text" in sql
+    assert "references public.threads_posts" not in sql
     assert "threads_known_posts" not in sql
 
 
