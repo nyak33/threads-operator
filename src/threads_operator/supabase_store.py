@@ -5,11 +5,67 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import pathlib
 import re
+import time
 from typing import Any
 
 import httpx
 
 from .threads_api import POST_METRICS, has_usable_metrics
+
+# Supabase gateway blips (project-level latency spikes) return 502/503/504 on
+# otherwise-valid GETs. Idempotent reads retry with exponential backoff so one
+# blip does not abort a whole collector run; writes are NEVER retried blindly.
+RETRY_STATUSES = frozenset({502, 503, 504})
+MAX_GET_RETRIES = 3
+GET_BACKOFF_BASE_SECONDS = 1.0
+
+
+class _RetryGetTransport(httpx.BaseTransport):
+    """Wrap an inner transport; retry only GETs on transient gateway errors."""
+
+    def __init__(
+        self,
+        inner: httpx.BaseTransport,
+        *,
+        sleep=time.sleep,
+        retries: int = MAX_GET_RETRIES,
+        backoff_base: float = GET_BACKOFF_BASE_SECONDS,
+    ) -> None:
+        self._inner = inner
+        self._sleep = sleep
+        self._retries = retries
+        self._backoff_base = backoff_base
+
+    def handle_request(
+        self, request: httpx.Request, *args: Any, **kwargs: Any
+    ) -> httpx.Response:
+        attempts = 0
+        while True:
+            response = self._inner.handle_request(request, *args, **kwargs)
+            retryable = (
+                request.method.upper() == "GET"
+                and response.status_code in RETRY_STATUSES
+                and attempts < self._retries
+            )
+            if not retryable:
+                return response
+            self._sleep(self._backoff_base * (2**attempts))
+            attempts += 1
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def make_default_client(
+    inner: httpx.BaseTransport | None = None,
+    *,
+    sleep=time.sleep,
+    timeout: float = 60.0,
+) -> httpx.Client:
+    """Build a client hardened against transient Supabase gateway 5xx on reads."""
+    transport = _RetryGetTransport(inner or httpx.HTTPTransport(), sleep=sleep)
+    return httpx.Client(transport=transport, timeout=timeout)
+
 
 ACCOUNT_TABLE = "threads_account_insights_snapshots"
 POST_TABLE = "threads_post_insights_snapshots"
@@ -33,7 +89,7 @@ class SupabaseStore:
         self.base_url = base_url.rstrip("/")
         self.service_role_key = service_role_key
         self.account_key = account_key
-        self.client = client or httpx.Client(timeout=30)
+        self.client = client or make_default_client()
 
     @property
     def _headers(self) -> dict[str, str]:
