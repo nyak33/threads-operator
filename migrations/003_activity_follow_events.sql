@@ -17,7 +17,7 @@ create table if not exists public.threads_activity_events (
     follow_count integer not null default 1 check (follow_count >= 1),
     attribution_possible boolean not null default true,
     story_type text,
-    matched_post_id text references public.threads_posts(thread_id) on delete set null,
+    matched_post_id text,
     matched_permalink text,
     match_method text,
     match_confidence text not null default 'unknown' check (
@@ -43,6 +43,8 @@ grant usage, select on sequence public.threads_activity_events_id_seq to service
 
 comment on table public.threads_activity_events is
     'Append-only observations from Threads /activity/follows, isolated by operator account_key.';
+comment on column public.threads_activity_events.matched_post_id is
+    'Threads post ID from deterministic matching. No FK: owned posts may come directly from the official API.';
 
 -- Rebuildable analytics: select the latest observed state for each account + notification,
 -- then aggregate follow_count by account + matched source post. Medium confidence stays
