@@ -39,9 +39,9 @@ def publish_next(
 ) -> dict[str, Any]:
     """Publish the oldest due approved queue row after winning its claim.
 
-    Dry-run only peeks. Live execution always claims first. Once the main post
-    exists its ID is persisted before any reply is attempted so a partial
-    failure is visible for manual reconciliation rather than blindly retried.
+    Dry-run only peeks. Live execution always claims first. Known external IDs
+    are persisted before the next publish step so partial failures remain visible
+    for manual reconciliation rather than being blindly retried.
     """
     if dry_run:
         candidate = store.peek_due_post(table, campaign_code=campaign_code)
@@ -72,6 +72,7 @@ def publish_next(
         for reply_text in replies:
             reply_id = api.publish_text(reply_text, reply_to_id=parent_id)
             reply_ids.append(reply_id)
+            store.mark_post_reply_progress(table, row_id, reply_ids)
             parent_id = reply_id
 
         store.mark_post_posted(table, row_id, reply_ids)
