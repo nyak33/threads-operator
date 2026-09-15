@@ -47,6 +47,7 @@ threads-operator accounts list
 threads-operator doctor --account <key>
 threads-operator insights --account <key>
 threads-operator activity-follow --account <key> --dry-run
+threads-operator enqueue-draft --account <key> --text <text>
 threads-operator publish --account <key> --dry-run
 ```
 
@@ -61,6 +62,8 @@ Use [`accounts/example.env`](accounts/example.env) as the safe template. New dep
 ```
 
 Each account can use the same Supabase project or a different one. Account-local mutable rows such as Activity observations and publish-queue work are scoped by `account_key` when a database is shared.
+
+LLM provider credentials do **not** belong in Threads Operator account files. If Hermes is configured to generate content, its model/API credentials stay in Hermes' own global/runtime configuration. Threads Operator receives only the already-generated text. See [`docs/hermes-content-generation.md`](docs/hermes-content-generation.md).
 
 ## Historical Insights
 
@@ -98,6 +101,21 @@ The Activity UI exposes source text/snippets rather than a guaranteed source-pos
 
 The detailed design and limitations remain in [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md).
 
+## Optional Hermes-Generated Drafts
+
+The default workflow remains external/ChatGPT-created content entering Supabase before Threads Operator executes it.
+
+Optionally, Hermes can use its own configured LLM/provider to generate content and submit the result as an account-scoped draft:
+
+```bash
+.venv/bin/threads-operator enqueue-draft \
+  --account syaqir \
+  --text "$GENERATED_TEXT" \
+  --campaign-code HERMES_GENERATED
+```
+
+This command never calls an LLM, never approves content and never publishes. It inserts `status=draft` into the selected account's configured queue. Model choice and LLM API keys remain entirely outside Threads Operator.
+
 ## Approved-Queue Publishing
 
 The generic Supabase queue is `threads_publish_queue`. Eligible work is account-scoped, `approved`, and due by `scheduled_at`. A worker conditionally claims the row before any Threads publish call.
@@ -121,15 +139,20 @@ For a fresh full deployment, apply the relevant migrations in filename order:
 - `001b_threads_insights_snapshots.sql`
 - `003_activity_follow_events.sql` for Activity
 - `004_threads_publish_queue.sql` for publishing
+- `005_activity_multi_account_upgrade.sql` where relevant for upgraded Activity data
+- `006_security_hardening.sql` to tighten operator table privileges
 
 Existing deployments that already applied the original single-account Activity migration must use the multi-account upgrade migration described in the runbook rather than dropping historical data.
 
 ## Safety
 
 - no real credentials, browser profiles or cookies belong in Git;
+- no LLM provider credentials belong in Threads Operator or its account ENV files;
 - account selection is explicit;
+- Threads API credentials are restricted to the official HTTPS API host;
 - Activity collection is read-only;
 - missing Insights metrics remain unknown/null;
+- generated content enters the queue as `draft` only;
 - live posting is opt-in per account;
 - a lost queue claim never publishes;
 - OAuth/permission failures are not treated as transient readiness failures;
@@ -142,6 +165,7 @@ Existing deployments that already applied the original single-account Activity m
 python -m pip install -e ".[dev]"
 python -m compileall -q src scripts
 python -m pytest -q
+python -m pip_audit --skip-editable
 ```
 
-GitHub Actions runs the same compile/test verification for pull requests.
+GitHub Actions runs the same compile/test verification and dependency audit for pull requests.
