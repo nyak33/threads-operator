@@ -13,14 +13,17 @@ A deployment should be able to:
 3. add one local account environment file per Threads account;
 4. establish a persistent browser login only when Activity collection is needed;
 5. run `threads-operator doctor --account <key>`;
-6. run Insights, Activity collection, and approved-queue publishing for that selected account.
+6. run Insights, Activity collection, deterministic draft ingress, and approved-queue publishing for that selected account.
 
 ## Boundaries
 
 - GitHub stores code, migrations, safe examples, tests, and operating instructions.
-- Real API tokens, Supabase service keys, browser profiles, cookies, and account sessions stay local to the deployment.
-- Hermes operates the system; deterministic code owns API calls, datastore state transitions, and safety gates.
-- Content strategy and LLM generation are not required inside this runtime.
+- Real Threads API tokens, Supabase service keys, browser profiles, cookies, and account sessions stay local to the deployment.
+- Hermes operates the system; deterministic code owns Threads API calls, datastore state transitions, account selection, and safety gates.
+- Content strategy and LLM generation stay outside the deterministic Threads Operator runtime.
+- Hermes may optionally generate content using model/provider credentials owned by Hermes, then pass only the generated text into the operator's account-scoped draft ingress.
+- Threads Operator does not own, read, select, or require an LLM provider/API key.
+- Generated content enters as `draft`; generation alone never approves or publishes it.
 - Live posting is opt-in per account and disabled by default.
 
 ## Success Criteria
@@ -29,5 +32,7 @@ A deployment should be able to:
 - Every account-bound command explicitly selects one account.
 - Account A cannot silently inherit Account B's exported credentials.
 - Activity remains read-only and account-isolated.
-- Queue publishing claims work before posting and preserves partial-failure state.
-- A fresh VPS can be brought to a runnable state from this repository plus local credentials.
+- External or Hermes-generated text can be inserted as an account-scoped draft without invoking Threads publishing.
+- Queue publishing claims approved work before posting and preserves partial-failure state.
+- Threads tokens are sent only to the official HTTPS Threads API host.
+- A fresh VPS can be brought to a runnable state from this repository plus local account credentials; optional LLM credentials remain entirely in Hermes.
