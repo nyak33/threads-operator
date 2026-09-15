@@ -12,12 +12,12 @@ def test_main_dispatches_insights_with_two_arguments(monkeypatch):
     assert len(calls) == 1
 
 
-def test_activity_follow_cli_passes_persist_false_for_dry_run(monkeypatch):
+def test_activity_follow_cli_passes_persist_false_and_account_key_for_dry_run(monkeypatch):
     seen = {}
 
     class DummyStore:
         def __init__(self, *a, **k):
-            pass
+            seen["store_kwargs"] = k
 
     monkeypatch.setattr(activity_cli, "SupabaseStore", DummyStore)
     monkeypatch.setattr(activity_cli, "collect_activity_follows", lambda **kwargs: seen.update(kwargs) or {
@@ -25,10 +25,15 @@ def test_activity_follow_cli_passes_persist_false_for_dry_run(monkeypatch):
         "high": 0, "medium": 0, "low": 0, "unknown": 0,
     })
     args = activity_cli._build_parser().parse_args(["activity-follow", "--dry-run"])
-    env = {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SERVICE_ROLE_KEY": "secret"}
+    env = {
+        "SUPABASE_URL": "https://example.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "secret",
+        "THREADS_ACCOUNT": "legacy_account",
+    }
     rc = activity_cli.cmd_activity_follow(env, args, activity_cli.pathlib.Path("/tmp/profile"))
     assert rc == 0
     assert seen["persist"] is False
+    assert seen["store_kwargs"]["account_key"] == "legacy_account"
 
 
 def test_insights_uses_default_threads_api_base_url_when_env_omits_it(monkeypatch):
