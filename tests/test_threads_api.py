@@ -40,6 +40,25 @@ def test_list_posts_normalizes_owned_posts():
     ]
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://graph.threads.net/v1.0",
+        "https://evil.example/v1.0",
+        "https://graph.threads.net.evil.example/v1.0",
+    ],
+)
+def test_threads_api_rejects_non_official_or_insecure_base_urls(base_url):
+    with pytest.raises(ValueError, match="official Threads API"):
+        ThreadsAPI("token", "user-123", base_url=base_url)
+
+
+def test_threads_api_accepts_official_https_base_url():
+    api = ThreadsAPI("token", "user-123", base_url="https://graph.threads.net/v1.0")
+    assert api.base_url == "https://graph.threads.net/v1.0"
+    api.client.close()
+
+
 def test_post_insights_parse_values_and_total_value_and_preserve_missing():
     def handler(request):
         assert request.url.path == "/v1.0/post-1/insights"
