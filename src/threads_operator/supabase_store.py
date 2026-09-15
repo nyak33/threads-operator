@@ -190,6 +190,45 @@ class SupabaseStore:
     def _utc_now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    def enqueue_draft(
+        self,
+        table: str,
+        main_post_text: str,
+        reply_texts: list[str] | None = None,
+        campaign_code: str | None = None,
+        scheduled_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert already-generated content as an account-scoped draft only."""
+        account_key = self._require_account_key()
+        if not isinstance(main_post_text, str) or not main_post_text.strip():
+            raise ValueError("main_post_text must not be empty")
+        replies = list(reply_texts or [])
+        if any(not isinstance(reply, str) or not reply.strip() for reply in replies):
+            raise ValueError("reply_texts must contain non-empty strings")
+
+        payload: dict[str, Any] = {
+            "account_key": account_key,
+            "main_post_text": main_post_text,
+            "reply_texts": replies,
+            "status": "draft",
+        }
+        if campaign_code:
+            payload["campaign_code"] = campaign_code
+        if scheduled_at:
+            payload["scheduled_at"] = scheduled_at
+
+        headers = {**self._headers, "Prefer": "return=representation"}
+        response = self.client.post(
+            self._queue_url(table),
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        if not rows:
+            raise ValueError("Draft insert did not return a queue row")
+        return rows[0]
+
     def peek_due_post(
         self,
         table: str,
