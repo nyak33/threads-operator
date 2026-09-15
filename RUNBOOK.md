@@ -35,9 +35,9 @@ If a prepared `.env` is supplied by the account owner instead, place it at the s
 
 Add additional accounts by repeating the command with a different account key. One repository installation can operate multiple Threads accounts.
 
-## 3. Account Environment
+## 3. Secret and Account Environment Boundary
 
-Use `accounts/example.env` as the contract. Each account file supplies its own:
+Use `accounts/example.env` as the Threads Operator account contract. Each account file supplies its own:
 
 - Threads access token and Threads user ID;
 - Supabase URL and service-role key;
@@ -46,7 +46,24 @@ Use `accounts/example.env` as the contract. Each account file supplies its own:
 - posting safety switches;
 - queue/campaign settings.
 
-Accounts may point to the same Supabase project or different Supabase projects. Shared databases still isolate mutable operator rows by `account_key`.
+LLM/model provider API keys do **not** belong in these account files or anywhere in the Threads Operator repository.
+
+If Hermes is configured to generate content, Hermes owns the provider/model credentials in its own global/runtime configuration. Threads Operator receives only the already-generated text.
+
+Recommended layout:
+
+```text
+Hermes global/runtime config
+  -> LLM provider/model credentials
+
+~/.threads-operator/accounts/account_a.env
+  -> account_a Threads + Supabase + browser/posting settings
+
+~/.threads-operator/accounts/account_b.env
+  -> account_b Threads + Supabase + browser/posting settings
+```
+
+Accounts may point to the same Supabase project or different Supabase projects. Shared databases still isolate mutable operator rows by `account_key`. For client/high-isolation deployments, prefer a separate Supabase project/service-role key per account or client.
 
 ## 4. Database Migrations
 
@@ -55,8 +72,11 @@ For a fresh database, apply the repository migrations in filename order that are
 1. `migrations/001_threads_insights.sql`
 2. `migrations/001b_threads_insights_snapshots.sql`
 3. `migrations/003_activity_follow_events.sql` if Activity is enabled
-4. `migrations/004_threads_publish_queue.sql` if queue publishing is enabled
+4. `migrations/004_threads_publish_queue.sql` if queue publishing or draft ingress is enabled
 5. `migrations/005_activity_multi_account_upgrade.sql` may also be applied; it is designed to be harmless when the fresh account-scoped Activity schema already exists.
+6. `migrations/006_security_hardening.sql` to remove client-role access from operator-owned Insights tables and retain service-role access.
+
+For an existing deployment, apply any not-yet-applied forward migrations. Do not drop production tables just to reach the latest schema.
 
 ### Existing single-account Activity database
 
@@ -119,7 +139,34 @@ THREADS_EXECUTION_MODE=auto_post
 
 Credentials alone never enable live posting.
 
-## 8. Multiple Accounts
+## 8. Optional Hermes Content Generation
+
+The default workflow may remain unchanged: ChatGPT or another external content system writes content into Supabase and Hermes/Threads Operator executes it.
+
+Optionally, Hermes may use the LLM/model already configured in Hermes to generate content itself. Keep generation separate from Threads Operator:
+
+```text
+Hermes model -> generated text -> enqueue-draft -> Supabase draft -> review/approval -> publisher
+```
+
+Submit generated main-post text as a draft:
+
+```bash
+.venv/bin/threads-operator enqueue-draft \
+  --account syaqir \
+  --text "$GENERATED_TEXT" \
+  --campaign-code HERMES_GENERATED
+```
+
+Optional replies can be supplied with repeated `--reply` arguments. `--scheduled-at` may be supplied as an ISO-8601 timestamp.
+
+`enqueue-draft` is deliberately safe: it uses the selected account's Supabase configuration, writes `status=draft`, does not call any LLM, does not approve the content and does not publish to Threads.
+
+Do not add an LLM API key to `accounts/<account>.env` just to use this feature. The model credential stays with Hermes.
+
+See `docs/hermes-content-generation.md` for the complete optional setup.
+
+## 9. Multiple Accounts
 
 Every scheduled job must name the account explicitly. For example, one cron may run Insights for `syaqir` and another for `brand_b`; both use the same installation but load different account files.
 
@@ -127,17 +174,19 @@ Do not rely on a shell-exported Threads token to distinguish accounts. The selec
 
 A failure in one account job should be reported for that account and must not cause another account's credentials or browser profile to be used as fallback.
 
-## 9. Publish Queue Rules
+If Hermes generates content for several accounts, generation jobs must also pass the intended account explicitly to `enqueue-draft`. Do not infer the target account from the generated text.
+
+## 10. Publish Queue Rules
 
 The generic queue is `threads_publish_queue` unless an account overrides `THREADS_QUEUE_TABLE`.
 
-Only rows for the selected `account_key` are eligible. By default, only `status=approved` rows whose `scheduled_at` is due can be claimed. An optional campaign code further narrows the queue.
+New content may enter as `draft`. Draft ingress never promotes it automatically. Only rows for the selected `account_key` are eligible for publishing, and by default only `status=approved` rows whose `scheduled_at` is due can be claimed. An optional campaign code further narrows the queue.
 
 The worker conditionally claims `approved -> posting` before calling Threads. The main Threads post ID is persisted before optional replies are attempted. Completed work becomes `posted`; visible partial failures become `failed` and retain known post IDs for reconciliation.
 
 If the network fails after Threads accepted a publish but before the returned ID can be persisted, do not blindly reset the row to `approved`. Reconcile the Threads account and queue state first; external publication cannot be made perfectly transactional with Supabase.
 
-## 10. Updating the Operator
+## 11. Updating the Operator
 
 Before pulling new code, preserve local account files and browser profiles outside the repository. Then:
 
@@ -146,14 +195,24 @@ git pull --ff-only
 bash scripts/bootstrap.sh
 ```
 
-Bootstrap is intended to be safe to run again. Re-run `doctor` for each enabled account after upgrades.
+Apply any new forward database migrations, including `006_security_hardening.sql` on deployments that predate it. Bootstrap is intended to be safe to run again. Re-run `doctor` for each enabled account after upgrades.
 
-## 11. Failure Rules
+## 12. Repository Security
+
+Keep `main` protected in GitHub and require the repository CI workflow before merge when repository settings permit it. This is a GitHub repository setting rather than runtime code.
+
+The CI workflow uses read-only repository permission, immutable action SHAs, the Python test suite and a dependency vulnerability audit. Treat a failed security/dependency check as a release blocker until reviewed.
+
+Do not commit production `.env` files, browser profiles, cookies, access tokens, Supabase service-role keys, or LLM provider keys.
+
+## 13. Failure Rules
 
 - Missing account selector: stop; never guess an account.
 - Missing account env: stop; do not fall back to another account's credentials.
+- Invalid/non-official Threads API base URL: stop before sending the Threads token.
 - Login/CAPTCHA/2FA challenge: stop Activity collection; do not bypass it.
 - OAuth/permission error: stop and repair credentials; do not retry as a transient publish failure.
 - Lost queue claim: do not publish.
 - Partial publish: retain known IDs and reconcile; do not blindly requeue.
 - Supabase unavailable: do not claim persistence or successful posting state.
+- Hermes/model generation failure: do not create or approve a placeholder draft.
