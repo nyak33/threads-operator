@@ -4,7 +4,9 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml", ".sql", ".example", ""}
+TEXT_SUFFIXES = {
+    ".md", ".py", ".toml", ".yaml", ".yml", ".sql", ".example", ".sh", ".env", ""
+}
 
 
 def publishable_files():
