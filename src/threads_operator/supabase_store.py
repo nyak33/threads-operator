@@ -267,6 +267,13 @@ class SupabaseStore:
             table, row_id, {"threads_main_post_id": str(post_id)}
         )
 
+    def mark_post_reply_progress(
+        self, table: str, row_id: int | str, reply_ids: list[str]
+    ) -> None:
+        self._patch_queue_row(
+            table, row_id, {"threads_reply_ids": list(reply_ids)}
+        )
+
     def mark_post_posted(
         self,
         table: str,
