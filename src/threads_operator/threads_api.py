@@ -1,7 +1,8 @@
-"""Read-only Threads Graph API adapter for owned posts and Insights."""
+"""Threads Graph API adapter for owned posts, Insights, and text publishing."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -85,6 +86,70 @@ class ThreadsAPI:
             ACCOUNT_METRICS,
         )
 
+    def create_text_container(
+        self, text: str, reply_to_id: str | None = None
+    ) -> str:
+        """Create a Threads TEXT media container and return its creation id."""
+        if not text or not text.strip():
+            raise ValueError("Threads text must not be empty")
+        data: dict[str, str] = {
+            "access_token": self.access_token,
+            "media_type": "TEXT",
+            "text": text,
+        }
+        if reply_to_id:
+            data["reply_to_id"] = str(reply_to_id)
+        response = self.client.post(
+            f"{self.base_url}/{self.user_id}/threads",
+            data=data,
+        )
+        response.raise_for_status()
+        creation_id = response.json().get("id")
+        if not creation_id:
+            raise ValueError("Threads create response did not include id")
+        return str(creation_id)
+
+    def publish_container(self, creation_id: str) -> str:
+        """Publish one existing media container and return the Threads post id."""
+        if not creation_id:
+            raise ValueError("Threads creation id is required")
+        response = self.client.post(
+            f"{self.base_url}/{self.user_id}/threads_publish",
+            data={
+                "access_token": self.access_token,
+                "creation_id": str(creation_id),
+            },
+        )
+        response.raise_for_status()
+        post_id = response.json().get("id")
+        if not post_id:
+            raise ValueError("Threads publish response did not include id")
+        return str(post_id)
+
+    def publish_text(
+        self,
+        text: str,
+        reply_to_id: str | None = None,
+        *,
+        max_attempts: int = 4,
+        retry_delay_seconds: float = 2.0,
+    ) -> str:
+        """Create and publish text, retrying only transient publish readiness failures."""
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
+        for attempt in range(max_attempts):
+            try:
+                return self.publish_container(creation_id)
+            except httpx.HTTPStatusError as exc:
+                if attempt >= max_attempts - 1 or not _is_transient_publish_error(
+                    exc.response
+                ):
+                    raise
+                if retry_delay_seconds > 0:
+                    time.sleep(retry_delay_seconds * (2**attempt))
+        raise RuntimeError("unreachable publish retry state")
+
     def _get_insights(
         self,
         url: str,
@@ -117,6 +182,32 @@ class ThreadsAPI:
             single.raise_for_status()
             _merge_metric_payload(result, single.json())
         return result
+
+
+def _is_transient_publish_error(response: httpx.Response) -> bool:
+    if response.status_code == 429 or response.status_code >= 500:
+        return True
+    if response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    if "oauth" in str(error.get("type", "")).lower():
+        return False
+    message = str(error.get("message", "")).lower()
+    return any(
+        marker in message
+        for marker in (
+            "still processing",
+            "not ready",
+            "media processing",
+            "processing media",
+        )
+    )
 
 
 def _is_metric_availability_error(response: httpx.Response) -> bool:
