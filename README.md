@@ -1,47 +1,81 @@
 # Threads Operator
 
-Reusable Hermes skills and deterministic helpers for operating a Threads account. The first implemented subsystem is `threads-insights`, which preserves historical account/post snapshots so growth and velocity can be calculated later instead of relying only on live lifetime totals.
+Portable deterministic helpers for operating one or many Threads accounts from a single VPS/Hermes installation.
 
-## Historical Insights MVP
+The repository owns account selection, official Threads API calls, historical Insights collection, read-only Activity/Follows collection, account-scoped Supabase state and approved-queue publishing. Real credentials and browser sessions stay outside GitHub.
 
-### What it stores
+## Architecture
 
-- account snapshots: followers, profile/account views and supported engagement totals
-- post snapshots: views, likes, replies, reposts, quotes, shares
-- post age at capture time
-- raw `NULL` for unavailable metrics rather than fabricated zeroes
-
-Raw snapshots are append-only. `threads_daily_rollups` is intentionally rebuildable.
-
-### Setup
-
-1. Apply `migrations/001_threads_insights.sql`, then `migrations/001b_threads_insights_snapshots.sql`, to the target Postgres/Supabase project. The `001b` migration creates the collision-safe `threads_account_insights_snapshots` and `threads_post_insights_snapshots` tables used by the collector.
-2. Copy `.env.example` to `.env` and fill values locally. Never commit `.env`.
-3. Install the package:
-
-```bash
-python -m pip install -e .
+```text
+one VPS / one Hermes / one threads-operator install
+                       |
+          +------------+------------+
+          |                         |
+      account A                   account B
+  API token + user ID         API token + user ID
+  browser profile            browser profile
+  Supabase config            Supabase config
+          |                         |
+          +---- shared codebase ----+
 ```
 
-4. Export/load the environment variables, then run one collection:
+Each account is selected explicitly. The operator never guesses which account should run and does not silently inherit another account's exported Threads/Supabase secrets.
+
+## Fresh VPS Quick Start
 
 ```bash
-python scripts/collect_insights.py
+git clone https://github.com/nyak33/threads-operator.git
+cd threads-operator
+bash scripts/bootstrap.sh
+bash scripts/add_account.sh syaqir
 ```
 
-The command prints a compact JSON summary and never prints credentials.
+Fill the local account file created at `~/.threads-operator/accounts/syaqir.env`, then validate it:
 
-### Collector behavior
+```bash
+.venv/bin/threads-operator doctor --account syaqir
+```
 
-- Recent post freshness is loaded in batched Supabase reads instead of one lookup per post.
-- The batch window is 25 hours, covering the longest 24-hour sampling interval.
-- Historical snapshots where all six core post metrics are `NULL` are ignored for freshness.
-- A new all-`NULL` post insight response is not stored and does not count as a failure; the post remains eligible for a later retry.
-- Partial metric responses remain valid and preserve unavailable fields as `NULL`. A measured zero remains a valid value.
+Add more accounts by repeating `add_account.sh` with another account key. One installation is shared; credentials, browser profiles and datastore settings remain separate.
 
-### Recommended scheduler
+See [`RUNBOOK.md`](RUNBOOK.md) for deployment, migration, browser-session, scheduling and failure-handling instructions. See [`GOAL.md`](GOAL.md) for system boundaries and [`PROGRESS.md`](PROGRESS.md) for current implementation status.
 
-Run the collector every 5 minutes. The collector decides whether each post is due:
+## Commands
+
+```text
+threads-operator accounts list
+threads-operator doctor --account <key>
+threads-operator insights --account <key>
+threads-operator activity-follow --account <key> --dry-run
+threads-operator publish --account <key> --dry-run
+```
+
+`--account` may be replaced by the operator-wide `THREADS_ACCOUNT` selector, but every account-bound command must resolve exactly one account.
+
+## Account Configuration
+
+Use [`accounts/example.env`](accounts/example.env) as the safe template. New deployments store real account files outside the repository at:
+
+```text
+~/.threads-operator/accounts/<account-key>.env
+```
+
+Each account can use the same Supabase project or a different one. Account-local mutable rows such as Activity observations and publish-queue work are scoped by `account_key` when a database is shared.
+
+## Historical Insights
+
+The Insights subsystem preserves historical account/post snapshots so growth and velocity can be calculated later rather than relying only on live lifetime totals.
+
+It stores:
+
+- account snapshots including supported follower/view/engagement totals;
+- post snapshots including views, likes, replies, reposts, quotes and shares;
+- post age at capture time;
+- raw `NULL` for unavailable metrics rather than fabricated zeroes.
+
+Raw snapshots are append-only. Partial metric responses remain valid. Historical all-`NULL` rows do not make a post appear fresh.
+
+Recommended post sampling remains age-aware:
 
 | Post age | Minimum interval |
 |---|---:|
@@ -54,42 +88,60 @@ Run the collector every 5 minutes. The collector decides whether each post is du
 
 Account snapshots default to every 15 minutes.
 
-Example cron entry after installing into the same Python environment:
+## Activity / Follows Attribution
 
-```cron
-*/5 * * * * cd /path/to/threads-operator && /path/to/python scripts/collect_insights.py >> /var/log/threads-insights.log 2>&1
+The optional Activity collector reads the authenticated Threads Activity/Follows page because `Followed from your post` information is not exposed as the same per-post official Insights metric.
+
+Each account uses its own persistent Chromium profile. The collector is deliberately read-only: it does not click, type, like, reply, follow, message, replay private requests or bypass authentication challenges.
+
+The Activity UI exposes source text/snippets rather than a guaranteed source-post ID. Matching therefore retains explicit high/medium/low/unknown confidence instead of presenting inferred attribution as exact fact.
+
+The detailed design and limitations remain in [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md).
+
+## Approved-Queue Publishing
+
+The generic Supabase queue is `threads_publish_queue`. Eligible work is account-scoped, `approved`, and due by `scheduled_at`. A worker conditionally claims the row before any Threads publish call.
+
+Live publishing is disabled by default. It requires both:
+
+```text
+THREADS_POSTING_ENABLED=true
+THREADS_EXECUTION_MODE=auto_post
 ```
 
-Use deployment-specific secret injection rather than putting credentials in the cron line.
+A dry run may inspect eligible work without claiming or publishing it.
 
-## Activity follow attribution (optional)
+The publisher persists the main Threads post ID before attempting optional replies. If a later step fails, the queue retains known IDs and moves to a visible failed state for reconciliation instead of blindly retrying the whole chain.
 
-Threads Web exposes `Followed from your post` activity that the official Threads Insights API does not provide as a per-post metric. The optional Activity collector design, verified limitations, matching-confidence rules, browser safety constraints and ready-to-paste Hermes implementation goal are documented in [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md).
+## Database Migrations
 
-Important: Activity exposes the source post **text/snippet**, but not a source post ID/permalink/timestamp. Matching to a known post must therefore preserve uncertainty for repeated content instead of claiming exact attribution when it cannot be proven.
+For a fresh full deployment, apply the relevant migrations in filename order:
 
-## Analytics primitives
+- `001_threads_insights.sql`
+- `001b_threads_insights_snapshots.sql`
+- `003_activity_follow_events.sql` for Activity
+- `004_threads_publish_queue.sql` for publishing
 
-`threads_operator.insights` currently provides deterministic helpers for:
-
-- follower/metric growth percentage
-- views or engagements per minute
-- age-aware snapshot intervals
-- conservative second-wave pattern detection
-
-Reports should distinguish `measured`, `calculated`, `inferred`, and `attributed` statements. Exact follower or profile-view attribution to a specific post is not claimed without an explicit attribution mechanism.
-
-## WhatsApp convention
-
-For simple Threads source attribution, deployment profiles may use the prefilled message:
-
-`Hi, saya datang dari Threads.`
-
-The public repository intentionally contains no real phone number.
+Existing deployments that already applied the original single-account Activity migration must use the multi-account upgrade migration described in the runbook rather than dropping historical data.
 
 ## Safety
 
-- no posting or replying is performed by the Insights collector
-- no credentials are stored in repository files
-- raw metric history is not overwritten by the collector
-- missing metrics stay unknown/null
+- no real credentials, browser profiles or cookies belong in Git;
+- account selection is explicit;
+- Activity collection is read-only;
+- missing Insights metrics remain unknown/null;
+- live posting is opt-in per account;
+- a lost queue claim never publishes;
+- OAuth/permission failures are not treated as transient readiness failures;
+- the operator does not automate passwords, CAPTCHA or 2FA bypass;
+- no LLM provider or content-generation logic is required by the deterministic runtime.
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+python -m compileall -q src scripts
+python -m pytest -q
+```
+
+GitHub Actions runs the same compile/test verification for pull requests.

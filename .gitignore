@@ -6,3 +6,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Multi-account runtime state and secrets
+accounts/*.env
+!accounts/example.env
+.threads-operator/
+browser-profiles/
