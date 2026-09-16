@@ -26,6 +26,7 @@ __all__ = [
     "TrendChallengeError",
     "expected_shortcode",
     "extract_post_evidence",
+    "extract_post_facts",
 ]
 
 # Built like activity_browser._PRELOADER_KEY: exact marker, no source-literal
@@ -95,6 +96,200 @@ def _walk_posts(value: Any):
             yield from _walk_posts(child)
 
 
+def _walk_with_parents(value: Any, parent: Any = None):
+    """Yield (dict_node, parent_dict_or_None) for every dict in the tree."""
+    if isinstance(value, dict):
+        yield value, parent
+        for child in value.values():
+            yield from _walk_with_parents(child, value)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_with_parents(child, parent)
+
+
+def _bbox_payloads(document_text: str):
+    """Yield each parseable Relay preloader result object in the document.
+
+    Raises TrendEnrichError on malformed JSON (fail closed — never parse a
+    truncated payload into partial facts).
+    """
+    found_key = False
+    search_from = 0
+    while True:
+        idx = document_text.find(_BBOX_KEY, search_from)
+        if idx == -1:
+            break
+        found_key = True
+        next_idx = document_text.find(_BBOX_KEY, idx + len(_BBOX_KEY))
+        payload = _parse_result_object(
+            document_text, idx, next_idx if next_idx != -1 else len(document_text)
+        )
+        if payload is not None:
+            yield payload
+        if next_idx == -1:
+            break
+        search_from = next_idx
+    if not found_key:
+        raise TrendEnrichError(
+            "no Relay preloader payload in document (OG-only or schema drift) "
+            "— fail closed, no anonymous fallback"
+        )
+
+
+def _clean_count(node: dict, key: str) -> int | None:
+    """Non-negative int at node[key] if genuinely present; bool is not int."""
+    if key not in node:
+        return None
+    value = node[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TrendEnrichError(f"{key} is not a valid non-negative count: {value!r}")
+    return value
+
+
+def _utc_from_taken_at(value: Any) -> str:
+    import datetime as _dt
+
+    if isinstance(value, bool):
+        raise TrendEnrichError("taken_at must be an integer epoch")
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise TrendEnrichError(f"taken_at is not a valid epoch: {value!r}")
+    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    if value > now + 86400 or value > 4102444800:  # > 2100: schema drift
+        raise TrendEnrichError(f"taken_at is implausibly far in the future: {value!r}")
+    return _dt.datetime.fromtimestamp(value, _dt.timezone.utc).isoformat()
+
+
+def _facts_from_node(node: dict, parent_lookup) -> dict[str, Any]:
+    """Build an OBSERVED-ONLY fact dict from one matched post node.
+
+    Absent/blank fields are omitted entirely (never null) so a later payload
+    that omits a field cannot erase previously known facts. view_count and
+    every token-ish key are structurally unreachable from this mapping.
+    """
+    pk = node.get("pk") or node.get("id")
+    if pk is None:
+        raise TrendEnrichError("matched post node without pk")
+    facts: dict[str, Any] = {"source_post_id": str(pk)}
+
+    user = node.get("user")
+    if isinstance(user, dict):
+        username = user.get("username")
+        if isinstance(username, str) and username.strip():
+            facts["source_username"] = username.strip()
+
+    text = node.get("text")
+    if not isinstance(text, str) or not text.strip():
+        caption = node.get("caption")
+        if isinstance(caption, dict):
+            text = caption.get("text")
+    if isinstance(text, str) and text.strip():
+        facts["source_text"] = text
+
+    if node.get("taken_at") is not None:
+        facts["published_at"] = _utc_from_taken_at(node["taken_at"])
+
+    likes = _clean_count(node, "like_count")
+    if likes is not None:
+        facts["likes"] = likes
+
+    app_info = node.get("text_post_app_info")
+    app_info = app_info if isinstance(app_info, dict) else {}
+    replies = _clean_count(app_info, "direct_reply_count")
+    if replies is None:
+        replies = _clean_count(app_info, "reply_count")
+    if replies is None:
+        replies = _clean_count(node, "direct_reply_count")
+    if replies is None:
+        replies = _clean_count(node, "reply_count")
+    if replies is not None:
+        facts["replies"] = replies
+    reposts = _clean_count(app_info, "repost_count")
+    if reposts is None:
+        reposts = _clean_count(node, "repost_count")
+    if reposts is not None:
+        facts["reposts"] = reposts
+    quotes = _clean_count(app_info, "quote_count")
+    if quotes is None:
+        quotes = _clean_count(node, "quote_count")
+    if quotes is not None:
+        facts["quotes"] = quotes
+
+    media_type = node.get("media_type")
+    if isinstance(media_type, int) and not isinstance(media_type, bool):
+        facts["media_type"] = media_type
+
+    # self_thread_length: the thread container that owns this post node.
+    holder = parent_lookup.get(id(node))
+    if holder is not None:
+        container = parent_lookup.get(id(holder))
+        items = container.get("thread_items") if isinstance(container, dict) else None
+        if isinstance(items, list) and any(
+            isinstance(i, dict) and i.get("post") is node for i in items
+        ):
+            facts["self_thread_length"] = len(items)
+
+    return facts
+
+
+def extract_post_facts(document_text: str, shortcode: str) -> dict[str, Any]:
+    """Return ONLY observed factual evidence for the post matching shortcode.
+
+    Same fail-closed identity contract as extract_post_evidence (exact code
+    match, conflicting pk = error, no pk = error, challenge = error), plus
+    validated counters (non-negative ints; present-as-0 kept), UTC
+    published_at from taken_at, username, text (post text else caption),
+    media_type, and self_thread_length. Unknown fields — especially any
+    view-ish key — are never mapped.
+    """
+    if not isinstance(shortcode, str) or not shortcode.strip():
+        raise ValueError("expected shortcode must be a non-blank string")
+    if not document_text or not document_text.strip():
+        raise TrendEnrichError("empty navigation document")
+    if _looks_like_challenge(document_text):
+        raise TrendChallengeError("login/security checkpoint page — STOP")
+
+    matches: list[tuple[dict, dict]] = []  # (node, parent_lookup)
+    pk_by_code: set[str] = set()
+    for payload in _bbox_payloads(document_text):
+        parent_lookup: dict[int, Any] = {}
+        nodes = list(_walk_with_parents(payload))
+        for node, parent in nodes:
+            parent_lookup[id(node)] = parent
+        for node, _parent in nodes:
+            if node.get("code") != shortcode:
+                continue
+            pk = node.get("pk") or node.get("id")
+            if pk is None:
+                continue
+            pk_by_code.add(str(pk))
+            matches.append((node, parent_lookup))
+        # match-without-pk still counts as "present but unusable"
+        for node, _parent in nodes:
+            if node.get("code") == shortcode and node.get("pk") is None \
+                    and node.get("id") is None:
+                pk_by_code.add("<no-pk>")
+
+    if not matches:
+        raise TrendEnrichError(
+            f"structured preloader present but no post with code {shortcode!r} "
+            "(and pk) — fail closed"
+        )
+    if len(pk_by_code) > 1:
+        raise TrendEnrichError(
+            f"conflicting structured matches for {shortcode!r}: pks {sorted(pk_by_code)}"
+        )
+
+    # Merge across duplicate occurrences: first match wins per field, but a
+    # richer later occurrence fills fields the first one lacked.
+    merged: dict[str, Any] = {}
+    for node, parent_lookup in matches:
+        for key, value in _facts_from_node(node, parent_lookup).items():
+            merged.setdefault(key, value)
+    return merged
+
+
 def _looks_like_challenge(text: str) -> bool:
     head = text[:60000].lower()
     if not any(marker in head for marker in _CHALLENGE_MARKERS):
@@ -111,45 +306,5 @@ def extract_post_evidence(document_text: str, shortcode: str) -> dict[str, str]:
     blank, only OG metadata available, preloader unparsable, no structured
     match, conflicting pk values for the same code, or a match without pk.
     """
-    if not isinstance(shortcode, str) or not shortcode.strip():
-        raise ValueError("expected shortcode must be a non-blank string")
-    if not document_text or not document_text.strip():
-        raise TrendEnrichError("empty navigation document")
-    if _looks_like_challenge(document_text):
-        raise TrendChallengeError("login/security checkpoint page — STOP")
-
-    matches: set[tuple[str, str]] = set()
-    found_key = False
-    search_from = 0
-    while True:
-        idx = document_text.find(_BBOX_KEY, search_from)
-        if idx == -1:
-            break
-        found_key = True
-        next_idx = document_text.find(_BBOX_KEY, idx + len(_BBOX_KEY))
-        payload = _parse_result_object(
-            document_text, idx, next_idx if next_idx != -1 else len(document_text)
-        )
-        if payload is not None:
-            for post in _walk_posts(payload):
-                if post["code"] == shortcode:
-                    matches.add((post["code"], post["pk"]))
-        if next_idx == -1:
-            break
-        search_from = next_idx
-
-    if not found_key:
-        raise TrendEnrichError(
-            "no Relay preloader payload in document (OG-only or schema drift) "
-            "— fail closed, no anonymous fallback in v1"
-        )
-    if not matches:
-        raise TrendEnrichError(
-            f"structured preloader present but no post with code {shortcode!r}"
-        )
-    pks = {pk for (_code, pk) in matches}
-    if len(pks) > 1:
-        raise TrendEnrichError(
-            f"conflicting structured matches for {shortcode!r}: pks {sorted(pks)}"
-        )
-    return {"code": shortcode, "pk": pks.pop()}
+    facts = extract_post_facts(document_text, shortcode)
+    return {"code": shortcode, "pk": facts["source_post_id"]}

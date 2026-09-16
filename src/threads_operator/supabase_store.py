@@ -105,6 +105,67 @@ _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Structured Threads pk shape: numeric id, optionally compound with : . _ -
 # separators (e.g. "1788000000000001" or "555:1788000000000001").
 _PK_RE = re.compile(r"^[0-9][0-9:._-]*$")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,60}$")
+
+
+def _iso_utc_timestamp(value: Any, field: str) -> str:
+    """Strict tz-aware ISO-8601 timestamp; naive/relative values rejected."""
+    import datetime as _dt
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-blank ISO-8601 timestamp string")
+    try:
+        parsed = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} is not a valid ISO-8601 timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must be timezone-aware (UTC) timestamp: {value!r}")
+    return parsed.astimezone(_dt.timezone.utc).isoformat()
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _validated_pk(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("source_post_id must be a non-blank string")
+    if not _PK_RE.fullmatch(value.strip()) or not any(c.isdigit() for c in value):
+        raise ValueError(
+            "source_post_id must look like a structured pk "
+            "(digits with optional :._- separators)"
+        )
+    return value.strip()
+
+
+def _validated_username(value: Any) -> str:
+    if not isinstance(value, str) or not _USERNAME_RE.fullmatch(value.strip()):
+        raise ValueError("source_username must be a plain Threads username")
+    return value.strip()
+
+
+def _validated_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("source_text must be a non-blank string")
+    return value
+
+
+_EVIDENCE_VALIDATORS: dict[str, Any] = {
+    # The ONLY columns trend evidence enrichment may touch. Anything not
+    # here (status, views, topic, analysis fields, raw_metadata,
+    # target_account_id, ...) is rejected by the store method itself.
+    "source_post_id": _validated_pk,
+    "source_username": _validated_username,
+    "source_text": _validated_text,
+    "published_at": lambda v: _iso_utc_timestamp(v, "published_at"),
+    "last_checked_at": lambda v: _iso_utc_timestamp(v, "last_checked_at"),
+    "likes": lambda v: _non_negative_int(v, "likes"),
+    "replies": lambda v: _non_negative_int(v, "replies"),
+    "reposts": lambda v: _non_negative_int(v, "reposts"),
+    "quotes": lambda v: _non_negative_int(v, "quotes"),
+}
 
 
 def trend_candidate_payload(
@@ -463,17 +524,30 @@ class SupabaseStore:
                 return row
         return None
 
-    def update_trend_candidate_source_post_id(
-        self, *, candidate_id: int, source_post_id: str
+    def update_trend_candidate_evidence(
+        self,
+        *,
+        candidate_id: int,
+        evidence: dict[str, Any],
+        enrichment: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Allowlisted factual UPDATE: writes ONLY ``source_post_id``.
+        """Account-scoped allowlisted factual UPDATE of observed evidence.
 
-        Account-scoped twice over: PATCH filters on id AND
-        target_account_id, and the filtered row is returned for inspection.
-        Deliberately cannot touch status, analysis fields, views, engagement
-        counters, or raw_metadata — the body is constructed here from a
-        single validated value. Fails closed on malformed input; returns
-        None (no error) when the account-scoped filter matches no row.
+        The method itself enforces ``id == candidate_id AND
+        target_account_id == account_key`` on both the merge read and the
+        PATCH — callers cannot pass another identity. A strict allowlist
+        gates every key (status, views, topic, trend_score, analysis
+        fields, raw_metadata, permalink, account id are REJECTED here before
+        any HTTP call), and every value is validated for shape. Absent keys
+        are simply not in the body — this method can never null a field.
+
+        ``enrichment`` facts (e.g. enrichment_source, media_type) are merged
+        over raw_metadata: the existing object is read back account-scoped
+        first and preserved; None raw_metadata merges into {}. A non-dict
+        raw_metadata fails closed without writing. Returns the updated row
+        or None when the account-scoped filter matches nothing (a
+        foreign-account candidate behaves as not found and is never
+        modified).
         """
         account_key = self._require_account_key()
         if (
@@ -482,14 +556,34 @@ class SupabaseStore:
             or candidate_id < 1
         ):
             raise ValueError("candidate id must be a positive integer")
-        if not isinstance(source_post_id, str) or not source_post_id.strip():
-            raise ValueError("source_post_id must be a non-blank string")
-        pk = source_post_id.strip()
-        if not _PK_RE.fullmatch(pk) or not any(ch.isdigit() for ch in pk):
-            raise ValueError(
-                "source_post_id must look like a structured pk "
-                "(digits with optional :._- separators)"
-            )
+        if not isinstance(evidence, dict) or not evidence:
+            raise ValueError("evidence must be a non-empty dict")
+
+        body: dict[str, Any] = {}
+        for key, value in evidence.items():
+            validator = _EVIDENCE_VALIDATORS.get(key)
+            if validator is None:
+                raise ValueError(
+                    f"evidence field {key!r} is not in the allowlist"
+                )
+            body[key] = validator(value)
+
+        if enrichment is not None:
+            if not isinstance(enrichment, dict) or not enrichment:
+                raise ValueError("enrichment must be a non-empty dict when given")
+            existing = self.get_trend_candidate(candidate_id)
+            if existing is None:
+                return None  # not found for THIS account: never modified
+            current_raw = existing.get("raw_metadata")
+            if current_raw is None:
+                current_raw = {}
+            if not isinstance(current_raw, dict):
+                raise ValueError(
+                    "existing raw_metadata is not an object — refusing to overwrite"
+                )
+            merged = {**current_raw, **enrichment}
+            body["raw_metadata"] = merged
+
         response = self.client.patch(
             f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
             headers={**self._headers, "Prefer": "return=representation"},
@@ -497,7 +591,7 @@ class SupabaseStore:
                 "id": f"eq.{candidate_id}",
                 "target_account_id": f"eq.{account_key}",
             },
-            json={"source_post_id": source_post_id.strip()},
+            json=body,
         )
         response.raise_for_status()
         rows = response.json() or []
@@ -505,6 +599,20 @@ class SupabaseStore:
             if isinstance(row, dict) and row.get("target_account_id") == account_key:
                 return row
         return None
+
+    def update_trend_candidate_source_post_id(
+        self, *, candidate_id: int, source_post_id: str
+    ) -> dict[str, Any] | None:
+        """Legacy v1 single-field path — delegates to the v2 evidence method.
+
+        One enforcement point: allowlist, value validation, account-scoped
+        WHERE id AND target_account_id, and never-null semantics all live in
+        update_trend_candidate_evidence.
+        """
+        return self.update_trend_candidate_evidence(
+            candidate_id=candidate_id,
+            evidence={"source_post_id": source_post_id},
+        )
 
     def list_posts(self) -> list[dict[str, Any]]:
         response = self.client.get(

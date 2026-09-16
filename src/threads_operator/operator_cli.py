@@ -98,7 +98,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     trend_enrich_p.add_argument("--account")
     trend_enrich_p.add_argument("--id", type=int, help="candidate id (live mode)")
-    trend_enrich_p.add_argument("--url", help="permalink (required with --dry-run)")
+    trend_enrich_p.add_argument("--url", help="permalink (dry-run by URL; else use --id)")
     trend_enrich_p.add_argument("--dry-run", action="store_true")
     trend_enrich_p.add_argument("--settle", type=float, default=3.0)
 
@@ -355,12 +355,17 @@ def _run_trend_enrich(
     dry_run: bool,
     settle: float,
 ) -> tuple[int, dict[str, Any]]:
-    """Deterministic read-only browser enrichment (v1: source_post_id only).
+    """Deterministic read-only browser enrichment (v2: allowlisted evidence).
 
-    Dry-run NEVER constructs a store; live mode only PATCHs the single
-    allowlisted factual field through the account-scoped store method.
+    Dry-run NEVER writes; with --id it may construct a read-only store for
+    the account-scoped candidate read. Live mode PATCHes only allowlisted
+    factual evidence through the account-scoped store method.
     """
-    from .trend_enrich import enrich_candidate, enrich_permalink_dry_run
+    from .trend_enrich import (
+        enrich_candidate,
+        enrich_candidate_dry_run,
+        enrich_permalink_dry_run,
+    )
 
     profile_raw = config.get("THREADS_BROWSER_PROFILE", "") or ""
     if not profile_raw:
@@ -369,11 +374,20 @@ def _run_trend_enrich(
     profile_dir = Path(profile_raw).expanduser()
 
     if dry_run:
-        if not url:
-            raise AccountConfigError("--url is required with --dry-run")
-        permalink, _username = normalize_threads_post_url(url)
-        result = enrich_permalink_dry_run(
-            permalink=permalink, profile_dir=profile_dir, settle_seconds=settle)
+        if url:
+            permalink, _username = normalize_threads_post_url(url)
+            result = enrich_permalink_dry_run(
+                permalink=permalink, profile_dir=profile_dir, settle_seconds=settle)
+            return 0, {"ok": True, "account": config.name, **result}
+        if candidate_id is None:
+            raise AccountConfigError(
+                "--url or --id is required with --dry-run")
+        result = enrich_candidate_dry_run(
+            _store(config),
+            candidate_id=candidate_id,
+            profile_dir=profile_dir,
+            settle_seconds=settle,
+        )
         return 0, {"ok": True, "account": config.name, **result}
 
     if candidate_id is None:

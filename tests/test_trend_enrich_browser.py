@@ -223,7 +223,15 @@ def test_enrich_writes_source_post_id_on_exact_match(monkeypatch):
     assert result["source_post_id"] == "1788000000000001"
     patches = [r for r in captured if r.method == "PATCH"]
     assert len(patches) == 1
-    assert json.loads(patches[0].content) == {"source_post_id": "1788000000000001"}
+    body = json.loads(patches[0].content)
+    # v2: allowlisted factual evidence only (observed pk + text + clock),
+    # plus the raw_metadata MERGE (enrichment keys only, never a clobber).
+    assert body["source_post_id"] == "1788000000000001"
+    assert body["source_text"] == "kita ni belakang kira"
+    assert body["last_checked_at"].endswith("+00:00")
+    assert body["raw_metadata"] == {"enrichment_source": "permalink_preloader"}
+    for forbidden in ("status", "views", "topic", "trend_score", "tone"):
+        assert forbidden not in body
     params = dict(patches[0].url.params)
     assert params["id"] == "eq.1"
     assert params["target_account_id"] == "eq.syaqir"
@@ -267,7 +275,11 @@ def test_enrich_candidate_not_found_is_error_no_write(monkeypatch):
 
 def test_enrich_already_matching_skips_write(monkeypatch):
     captured: list = []
-    row = {**CANDIDATE, "source_post_id": "1788000000000001"}
+    row = {
+        **CANDIDATE,
+        "source_post_id": "1788000000000001",
+        "source_text": "kita ni belakang kira",
+    }
     store = make_store(captured, [row])
     stub_reader(monkeypatch)
 

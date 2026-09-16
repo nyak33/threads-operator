@@ -76,7 +76,7 @@ def test_trend_enrich_dry_run_never_constructs_store(tmp_path, capsys, monkeypat
     assert payload["dry_run"] is True
     assert payload["writes"] == 0
     assert payload["evidence"]["source_post_id"] == "1788000000000001"
-    assert payload["evidence"]["code"] == SHORTCODE
+    assert payload["expected_shortcode"] == SHORTCODE
 
 
 def test_trend_enrich_dry_run_output_sanitized(tmp_path, capsys, monkeypatch, stub_reader):
@@ -145,9 +145,9 @@ def test_trend_enrich_live_patches_store(monkeypatch, tmp_path, capsys):
         def get_trend_candidate(self, cid):
             return candidate
 
-        def update_trend_candidate_source_post_id(self, *, candidate_id, source_post_id):
-            patches.append((candidate_id, source_post_id))
-            return {**candidate, "source_post_id": source_post_id}
+        def update_trend_candidate_evidence(self, *, candidate_id, evidence, enrichment=None):
+            patches.append((candidate_id, evidence))
+            return {**candidate, **evidence}
 
     monkeypatch.setattr(operator_cli, "SupabaseStore", FakeStore)
 
@@ -157,7 +157,8 @@ def test_trend_enrich_live_patches_store(monkeypatch, tmp_path, capsys):
     )
 
     assert code == 0
-    assert patches == [(1, "1788000000000001")]
+    assert patches[0][0] == 1
+    assert patches[0][1]["source_post_id"] == "1788000000000001"
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["updated"] is True
