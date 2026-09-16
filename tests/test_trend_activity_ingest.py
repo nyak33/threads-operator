@@ -43,12 +43,23 @@ EVENT = {
 
 
 class RecordingStore:
-    """Captures insert_trend_candidate calls; enforces account scoping."""
+    """Captures insert/provenance calls; enforces account scoping."""
 
-    def __init__(self, existing_permalink=None):
+    def __init__(self, existing_permalink=None, existing_meta=None):
         self.account_key = "syaqir"
         self.calls = []
+        self.provenance_calls = []
         self.existing_permalink = existing_permalink
+        self.existing_meta = existing_meta or {}
+        self._merged_meta = dict(self.existing_meta)
+
+    def find_trend_candidate_by_permalink(self, permalink, *, account_key=None):
+        assert account_key in (None, "syaqir")
+        if self.existing_permalink and permalink == self.existing_permalink:
+            return {"id": 99, "target_account_id": "syaqir",
+                    "source_username": "syaqir_sharani",
+                    "raw_metadata": dict(self._merged_meta)}
+        return None
 
     def insert_trend_candidate(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
@@ -56,6 +67,13 @@ class RecordingStore:
         if self.existing_permalink and canon == self.existing_permalink:
             return {"status": "existing", "id": 99, "permalink": canon}
         return {"status": "inserted", "id": 42, "permalink": canon}
+
+    def update_trend_candidate_provenance(self, *, candidate_id, raw_metadata):
+        self.provenance_calls.append(
+            {"candidate_id": candidate_id,
+             "raw_metadata": json.loads(json.dumps(raw_metadata))})
+        self._merged_meta = dict(raw_metadata)
+        return {"id": candidate_id}
 
 
 def api_with(handler):
@@ -137,17 +155,27 @@ def test_bridge_canonical_permalink_must_be_shortcode_form():
 
 
 # ---------------------------------------------------------------- dedup
-def test_numeric_activity_url_dedups_against_existing_shortcode_row():
-    """The bridged permalink IS the manual-path identity => second insert
-    returns 'existing' with no new row (no threads.net/threads.com dupes)."""
+def test_numeric_activity_url_merges_into_existing_shortcode_row():
+    """The bridged permalink IS the manual-path identity => NO second row;
+    the existing candidate gains Activity provenance instead (multi-source:
+    one row, two discovery methods)."""
     api = api_with(graph_ok)
-    store = RecordingStore(existing_permalink=CANON_SHORTCODE)
+    store = RecordingStore(
+        existing_permalink=CANON_SHORTCODE,
+        existing_meta={"candidate_role": "external_trend", "manual": True,
+                       "discovery_method": "manual_url"})
     result = ingest_activity_candidate(store, api, EVENT)
-    assert result["status"] == "existing"
+    assert result["status"] == "existing_provenance_updated"
     assert result["id"] == 99
-    # idempotent second ingest: still existing
+    assert store.calls == []  # never a second insert attempt
+    written = store.provenance_calls[0]["raw_metadata"]
+    assert written["candidate_role"] == "external_trend"  # history preserved
+    assert written["candidate_roles"] == ["own_performance"]
+    assert written["discovery_methods"] == ["manual_url", "activity_attribution"]
+    # idempotent second ingest: same event => unchanged, no churn
     again = ingest_activity_candidate(store, api, EVENT)
-    assert again["status"] == "existing"
+    assert again["status"] == "existing_unchanged"
+    assert again["writes"] == 0
 
 
 # -------------------------------------------------------------- metadata
@@ -230,12 +258,15 @@ def test_ambiguous_match_method_still_ingested_as_fact():
         "nearest_prior_inference"
 
 
-def test_external_manual_role_unchanged():
+def test_manual_ingestion_default_is_role_free_channel_fact():
+    """Default manual payload records the channel ONLY: manual=true /
+    manual_url, candidate_role=manual_ingress — never external_trend."""
     payload = trend_candidate_payload("syaqir", CANON_SHORTCODE)
     meta = payload["raw_metadata"]
-    assert meta["candidate_role"] == "external_trend"
+    assert meta["candidate_role"] == "manual_ingress"
     assert meta["manual"] is True
     assert meta["discovery_method"] == "manual_url"
+    assert "external_trend" not in json.dumps(meta)
 
 
 def test_own_performance_payload_via_insert_kwarg():

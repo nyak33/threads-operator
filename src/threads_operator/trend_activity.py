@@ -2,71 +2,58 @@
 
 Deterministic path: validated threads_activity_events row -> official Graph
 API identity bridge (numeric fbid permalink -> canonical shortcode
-permalink, exact id echo required) -> insert-or-existing trend candidate
-via the existing store dedup identity (target_account_id,
-source_permalink).
+permalink, exact id echo required) -> merge provenance into the ONE
+candidate identified by (target_account_id, source_permalink).
+
+Multi-source provenance (trend_provenance): an Activity event PROVES the
+own_performance analytical role and adds activity_attribution as a
+discovery method, without destroying how the row originally entered the
+store (manual_url etc.). Roles/methods/attributions live in raw_metadata
+lists; legacy scalar mirrors are kept for older readers. Activity
+ingestion NEVER assigns external_trend (reserved for a future explicit
+external-discovery workflow) and NEVER maps the follower username to the
+post author.
+
+Return statuses (deterministic, spec §10):
+- inserted                      new candidate row created
+- existing_unchanged            same event re-run; zero DB churn
+- existing_provenance_updated   a (possibly different) event merged new
+                                provenance into the existing row
+- would_insert / would_update_provenance (with writes=0) under dry_run
 
 Hard rules:
 - LLM never involved; browser never used here.
 - A numeric permalink is ONLY ever stored after the API bridge proves the
   shortcode identity; unproven identity fails closed with no write.
-- The Activity event's visible_username is the FOLLOWER, never the post
-  author; it is stored solely as raw_metadata.activity_follower_username.
 - Target account always comes from the store's own account_key; the event
   account_key must match it (no cross-account writes via crafted events).
+- Provenance writes go through update_trend_candidate_provenance, which is
+  account-scoped and raw_metadata-only: status, metrics, enrichment facts
+  and analysis fields are unreachable from this path.
 - No status transitions, no automatic seeding, no scheduling here.
 """
 from __future__ import annotations
 
 from typing import Any
 
+from .trend_provenance import (
+    activity_attribution_from_event,
+    merge_activity_provenance,
+    provenance_for_insert,
+)
 from .trend_urls import identity_forms, normalize_threads_post_url
 
-__all__ = ["activity_candidate_metadata", "ingest_activity_candidate"]
+__all__ = ["ingest_activity_candidate"]
 
 
-def activity_candidate_metadata(event: dict[str, Any]) -> dict[str, Any]:
-    """Factual attribution metadata for one Activity event.
+def _bridge_to_canonical(api, event: dict[str, Any]) -> tuple[str, str, str | None]:
+    """Validate event + permalink and return (canonical, author, numeric_id).
 
-    Only non-sensitive observed facts from the event row. No snippet text,
-    no analysis. Follower username kept under an explicit
-    activity_follower_username key (it is NOT the source author).
-    """
-    meta: dict[str, Any] = {}
-    if event.get("id") is not None:
-        meta["activity_event_id"] = event["id"]
-    if event.get("match_method"):
-        meta["activity_match_method"] = str(event["match_method"])
-    if event.get("match_confidence"):
-        meta["activity_match_confidence"] = str(event["match_confidence"])
-    if event.get("collected_at"):
-        meta["activity_collected_at"] = str(event["collected_at"])
-    if event.get("visible_username"):
-        meta["activity_follower_username"] = str(event["visible_username"])
-    return meta
-
-
-def ingest_activity_candidate(store, api, event: dict[str, Any]) -> dict[str, Any]:
-    """Create/locate an own_performance candidate from one Activity event.
-
-    Returns the insert_trend_candidate result dict
-    ({"status": inserted|existing, "id", "permalink", ...} plus
-    "numeric_id" when bridged). Raises ValueError — before ANY write — on:
-    missing/unparseable matched_permalink, event account mismatch, or a
-    failed/inconsistent API identity bridge.
+    Raises ValueError before ANY write on account mismatch, missing or
+    unparseable permalink, or a failed/inconsistent identity bridge.
     """
     if not isinstance(event, dict):
         raise ValueError("activity event must be a dict")
-
-    event_account = str(event.get("account_key") or "").strip()
-    store_account = getattr(store, "account_key", None)
-    if not store_account:
-        raise ValueError("store must carry account_key for candidate writes")
-    if event_account and event_account != store_account:
-        raise ValueError(
-            "activity event account_key does not match store account")
-    if not event_account:
-        event_account = store_account
 
     permalink = event.get("matched_permalink")
     if not permalink or not str(permalink).strip():
@@ -77,7 +64,6 @@ def ingest_activity_candidate(store, api, event: dict[str, Any]) -> dict[str, An
         raise ValueError("matched_permalink missing @username")
 
     numeric_id: str | None = None
-    canonical = str(permalink)
     if forms["kind"] == "numeric":
         # Bridge required: numeric fbid -> proven shortcode permalink.
         numeric_id = forms["numeric_id"]
@@ -97,21 +83,97 @@ def ingest_activity_candidate(store, api, event: dict[str, Any]) -> dict[str, An
         if b_forms["username"] != author_username:
             raise ValueError(
                 "identity bridge permalink author disagrees with event URL")
-        canonical = b_canon
-    else:
-        canonical, _ = normalize_threads_post_url(permalink)
+        return b_canon, author_username, numeric_id
+    canonical, _ = normalize_threads_post_url(permalink)
+    return canonical, author_username, None
 
-    metadata = activity_candidate_metadata(event)
-    if numeric_id:
-        metadata["activity_numeric_id"] = numeric_id
 
-    result = store.insert_trend_candidate(
-        canonical,
-        candidate_role="own_performance",
-        source_username=author_username,
-        raw_metadata=metadata,
-    )
-    result = dict(result)
+def ingest_activity_candidate(
+    store,
+    api,
+    event: dict[str, Any],
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Merge one Activity event's provenance into its canonical candidate.
+
+    Raises ValueError — before ANY write — on: missing/unparseable
+    matched_permalink, event account mismatch, or a failed/inconsistent
+    API identity bridge.
+    """
+    if not isinstance(event, dict):
+        raise ValueError("activity event must be a dict")
+    event_account = str(event.get("account_key") or "").strip()
+    store_account = getattr(store, "account_key", None)
+    if not store_account:
+        raise ValueError("store must carry account_key for candidate writes")
+    if event_account and event_account != store_account:
+        raise ValueError(
+            "activity event account_key does not match store account")
+
+    canonical, author_username, numeric_id = _bridge_to_canonical(api, event)
+    attribution = activity_attribution_from_event(event, numeric_id=numeric_id)
+
+    base = {"permalink": canonical}
     if numeric_id:
-        result["numeric_id"] = numeric_id
-    return result
+        base["numeric_id"] = numeric_id
+
+    existing = store.find_trend_candidate_by_permalink(
+        canonical, account_key=store_account)
+    if existing is None:
+        metadata = provenance_for_insert(attribution)
+        if dry_run:
+            return {
+                **base,
+                "status": "would_insert",
+                "writes": 0,
+                "preview_raw_metadata": metadata,
+            }
+        result = dict(store.insert_trend_candidate(
+            canonical,
+            candidate_role="own_performance",
+            source_username=author_username,
+            raw_metadata=metadata,
+        ))
+        if result.get("status") == "existing":
+            # Lost a dedup race against an identical insert: merge into the
+            # winner row instead of stopping at a bare "existing".
+            winner = store.find_trend_candidate_by_permalink(
+                canonical, account_key=store_account)
+            if winner is not None:
+                return _merge_existing(store, winner, attribution, base,
+                                       insert_result=result)
+            return {**base, **result}
+        return {**base, **result}
+
+    return _merge_existing(store, existing, attribution, base, dry_run=dry_run)
+
+
+def _merge_existing(store, row, attribution, base, *, dry_run=False,
+                    insert_result=None):
+    candidate_id = row.get("id")
+    if candidate_id is None:
+        raise ValueError("existing candidate row has no id — refusing blind merge")
+    merged, changed = merge_activity_provenance(
+        row.get("raw_metadata") or {}, attribution)
+    if not changed:
+        out = {**base, "status": "existing_unchanged", "id": candidate_id,
+               "writes": 0}
+        if insert_result:
+            out["insert"] = insert_result
+        return out
+    if dry_run:
+        return {**base, "status": "would_update_provenance",
+                "id": candidate_id, "writes": 0,
+                "preview_raw_metadata": merged}
+    updated = store.update_trend_candidate_provenance(
+        candidate_id=candidate_id, raw_metadata=merged)
+    if updated is None:
+        # Row vanished or failed the account-scoped read: never blind-write.
+        return {**base, "status": "existing_unchanged", "id": candidate_id,
+                "writes": 0, "reason": "account-scoped re-read found no row"}
+    out = {**base, "status": "existing_provenance_updated",
+           "id": candidate_id, "writes": 1}
+    if insert_result:
+        out["insert"] = insert_result
+    return out

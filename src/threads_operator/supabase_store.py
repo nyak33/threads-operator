@@ -169,10 +169,17 @@ _EVIDENCE_VALIDATORS: dict[str, Any] = {
 
 
 TREND_CANDIDATE_ROLES = {
-    # Logical roles inside the ONE candidates table (no schema change):
-    # external_trend     - manually added public posts (original path)
-    # own_performance    - Activity-attributed posts from this account
+    # Scalar channel FACTS recorded inside raw_metadata at insertion time.
+    # These are NOT analytical roles. "manual_ingress" only records HOW the
+    # row entered the store: manual ingestion alone does NOT imply
+    # external_trend (that analytical role is reserved for a future
+    # explicit external-discovery workflow). "external_trend" remains a
+    # valid legacy value so historical rows keep parsing, but it is no
+    # longer assigned automatically. The proven analytical role
+    # own_performance comes from Activity attribution via the
+    # trend_provenance merge layer (raw_metadata.candidate_roles).
     "external_trend": {"manual": True, "discovery_method": "manual_url"},
+    "manual_ingress": {"manual": True, "discovery_method": "manual_url"},
     "own_performance": {"manual": False,
                         "discovery_method": "activity_attribution"},
 }
@@ -183,7 +190,7 @@ def trend_candidate_payload(
     url: str,
     *,
     now: str | None = None,
-    candidate_role: str = "external_trend",
+    candidate_role: str = "manual_ingress",
     source_username: str | None = None,
     source_text: str | None = None,
     published_at: str | None = None,
@@ -200,10 +207,12 @@ def trend_candidate_payload(
     render the exact same sanitized shape. Analysis fields (topic, tone,
     trend_score, ...) are intentionally never set here.
 
-    candidate_role selects the raw_metadata role facts:
-    external_trend => manual=true/manual_url (historical shape, unchanged);
-    own_performance => manual=false/activity_attribution. Unknown roles are
-    rejected before any write.
+    candidate_role selects the raw_metadata scalar channel facts:
+    manual_ingress (default) => manual=true/manual_url — how the row
+    entered the store, with NO analytical role assigned (manual alone is
+    not proof of external_trend); own_performance => manual=
+    false/activity_attribution. external_trend remains accepted only for
+    legacy-compatible callers. Unknown roles are rejected before any write.
     """
     permalink, username = normalize_threads_post_url(url)
     if not account_key:
@@ -397,7 +406,7 @@ class SupabaseStore:
         self,
         url: str,
         *,
-        candidate_role: str = "external_trend",
+        candidate_role: str = "manual_ingress",
         source_username: str | None = None,
         source_text: str | None = None,
         published_at: str | None = None,
@@ -441,7 +450,6 @@ class SupabaseStore:
                 "id": found.get("id"),
                 "permalink": permalink,
             }
-
         payload = trend_candidate_payload(
             account_key,
             url,
@@ -636,6 +644,98 @@ class SupabaseStore:
             candidate_id=candidate_id,
             evidence={"source_post_id": source_post_id},
         )
+
+    # ------------------------------------------------------------- provenance
+
+    def find_trend_candidate_by_permalink(
+        self,
+        permalink: str,
+        *,
+        account_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        """SELECT one candidate by the unique (account, permalink) identity.
+
+        ``account_key`` defaults to the store's own account and is ALWAYS
+        part of the filter — callers cannot probe another account. Returns
+        the full evidence-shaped row (id, source_username, raw_metadata,
+        ...) or None. Read-only.
+        """
+        effective = account_key or self._require_account_key()
+        if not effective:
+            raise ValueError("account_key is required for candidate reads")
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params={
+                "target_account_id": f"eq.{effective}",
+                "source_permalink": f"eq.{permalink}",
+                "select": ",".join(TREND_EVIDENCE_COLUMNS),
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        for row in response.json() or []:
+            if isinstance(row, dict) and row.get("target_account_id") == effective:
+                return row
+        return None
+
+    def update_trend_candidate_provenance(
+        self,
+        *,
+        candidate_id: int,
+        raw_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Account-scoped raw_metadata-ONLY provenance UPDATE.
+
+        The blast radius is structurally one column: the request body is
+        exactly ``{"raw_metadata": ...}`` — status, source_text,
+        source_post_id, metrics, views, trend_score, topic, hook_type,
+        tone, why_it_works and adaptation_angle CANNOT be modified through
+        this path. WHERE is always ``id == candidate_id AND
+        target_account_id == self.account_key``; a foreign-account row
+        matches nothing and returns None without any write attempt on it.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        if not isinstance(raw_metadata, dict) or not raw_metadata:
+            raise ValueError("raw_metadata must be a non-empty dict")
+        if not isinstance(raw_metadata.get("candidate_roles"), list) and \
+                not isinstance(raw_metadata.get("discovery_methods"), list) and \
+                not isinstance(raw_metadata.get("activity_attributions"), list):
+            raise ValueError(
+                "provenance update requires at least one provenance list")
+
+        # Read back account-scoped first so a non-dict raw_metadata or a
+        # missing/foreign row can never be clobbered blindly.
+        existing = self.get_trend_candidate(candidate_id)
+        if existing is None:
+            return None
+        current_raw = existing.get("raw_metadata")
+        if current_raw is not None and not isinstance(current_raw, dict):
+            raise ValueError(
+                "existing raw_metadata is not an object — refusing to overwrite")
+
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+            json={"raw_metadata": raw_metadata},
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
 
     def list_posts(self) -> list[dict[str, Any]]:
         response = self.client.get(
