@@ -115,9 +115,10 @@ def test_trend_add_real_run_uses_selected_account_store(
 
 def test_trend_add_no_target_account_id_flag_exists(tmp_path):
     parser_env = {"THREADS_OPERATOR_HOME": str(tmp_path)}
-    with pytest.raises(SystemExit):
-        operator_cli.main(
-            ["trend", "add", "--account", "brand_a", "--url", URL,
-             "--target-account-id", "victim"],
-            process_env=parser_env,
-        )
+    # Parse errors fail closed: non-zero exit code, no store constructed.
+    code = operator_cli.main(
+        ["trend", "add", "--account", "brand_a", "--url", URL,
+         "--target-account-id", "victim"],
+        process_env=parser_env,
+    )
+    assert code != 0

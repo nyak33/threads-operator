@@ -20,7 +20,7 @@ from .activity_collector import collect_activity_follows
 from .collector import collect_once
 from .publisher import publish_next
 from .safe_errors import redact_error
-from .supabase_store import SupabaseStore, trend_candidate_payload
+from .supabase_store import SupabaseStore, TREND_STATUSES, trend_candidate_payload
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
 
 _EXECUTION_MODES = {"draft_only", "approval_required", "auto_post"}
@@ -77,6 +77,17 @@ def _parser() -> argparse.ArgumentParser:
     trend_add.add_argument("--text")
     trend_add.add_argument("--username")
     trend_add.add_argument("--dry-run", action="store_true")
+    trend_list = trend_sub.add_parser(
+        "list", help="List this account's trend candidates (read-only)"
+    )
+    trend_list.add_argument("--account")
+    trend_list.add_argument("--limit", type=int, default=20)
+    trend_list.add_argument("--status", choices=sorted(TREND_STATUSES))
+    trend_show = trend_sub.add_parser(
+        "show", help="Show one trend candidate (read-only)"
+    )
+    trend_show.add_argument("--account")
+    trend_show.add_argument("--id", type=int, required=True)
 
     return parser
 
@@ -297,13 +308,42 @@ def _run_trend_add(
     }
 
 
+def _run_trend_list(
+    config: AccountConfig, *, limit: int, status: str | None
+) -> tuple[int, dict[str, Any]]:
+    # Read-only: SELECT via store list_trend_candidates; account isolation is
+    # enforced inside the store layer against self.account_key.
+    candidates = _store(config).list_trend_candidates(limit=limit, status=status)
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "writes": 0,
+        "count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+def _run_trend_show(config: AccountConfig, *, candidate_id: int) -> tuple[int, dict[str, Any]]:
+    row = _store(config).get_trend_candidate(candidate_id)
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "writes": 0,
+        "found": row is not None,
+        "candidate": row,
+    }
+
+
 def main(
     argv: list[str] | None = None,
     *,
     process_env: Mapping[str, str] | None = None,
 ) -> int:
     env = process_env if process_env is not None else os.environ
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:  # invalid flags/choices: fail closed, no writes
+        return int(exc.code or 2)
 
     if args.command == "accounts" and args.accounts_command == "list":
         for account in list_accounts(env):
@@ -339,6 +379,12 @@ def main(
                 username=args.username,
                 dry_run=args.dry_run,
             )
+        elif args.command == "trend" and args.trend_command == "list":
+            code, payload = _run_trend_list(
+                config, limit=args.limit, status=args.status
+            )
+        elif args.command == "trend" and args.trend_command == "show":
+            code, payload = _run_trend_show(config, candidate_id=args.id)
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:

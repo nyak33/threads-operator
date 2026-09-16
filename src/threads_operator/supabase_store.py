@@ -73,6 +73,34 @@ POST_TABLE = "threads_post_insights_snapshots"
 ACTIVITY_EVENTS_TABLE = "threads_activity_events"
 OWN_POSTS_TABLE = "threads_posts"
 TREND_CANDIDATES_TABLE = "threads_trend_candidates"
+
+# Statuses that exist in the live schema check — do not invent new ones.
+TREND_STATUSES = frozenset(
+    {"discovered", "reviewed", "approved", "rejected", "used", "stale"}
+)
+
+# Explicit SELECT column allowlist: evidence fields only. Analysis fields
+# (topic/tone/score...) are intentionally not fetched or fabricated here;
+# reads pass through whatever the row already contains via the CLI.
+TREND_EVIDENCE_COLUMNS = (
+    "id",
+    "target_account_id",
+    "source_platform",
+    "source_post_id",
+    "source_username",
+    "source_permalink",
+    "source_text",
+    "published_at",
+    "discovered_at",
+    "last_checked_at",
+    "views",
+    "likes",
+    "replies",
+    "reposts",
+    "quotes",
+    "status",
+    "raw_metadata",
+)
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -363,6 +391,74 @@ class SupabaseStore:
             "id": rows[0].get("id") if rows else None,
             "permalink": permalink,
         }
+
+    # ------------------------------------------------------------------ reads
+
+    def list_trend_candidates(
+        self,
+        *,
+        limit: int = 20,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """SELECT-only, account-scoped trend candidate listing.
+
+        Account isolation is enforced here: the filter always uses
+        self.account_key and callers cannot pass another identity. Newest
+        discovered_at first. No writes, no Threads API, no browser, no LLM.
+        """
+        account_key = self._require_account_key()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        if status is not None and status not in TREND_STATUSES:
+            raise ValueError(
+                "status must be one of: " + ", ".join(sorted(TREND_STATUSES))
+            )
+        params: dict[str, Any] = {
+            "select": ",".join(TREND_EVIDENCE_COLUMNS),
+            "target_account_id": f"eq.{account_key}",
+            "order": "discovered_at.desc",
+            "limit": str(limit),
+        }
+        if status:
+            params["status"] = f"eq.{status}"
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params=params,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        return [r for r in rows if isinstance(r, dict)]
+
+    def get_trend_candidate(self, candidate_id: int) -> dict[str, Any] | None:
+        """SELECT one candidate scoped by BOTH id and target_account_id.
+
+        A row belonging to another account reads as missing (KeyError never
+        escapes; returns None). Client-side account check is kept as
+        belt-and-braces against a leaky server-side filter.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params={
+                "select": ",".join(TREND_EVIDENCE_COLUMNS),
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
 
     def list_posts(self) -> list[dict[str, Any]]:
         response = self.client.get(
