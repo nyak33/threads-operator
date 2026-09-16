@@ -102,6 +102,9 @@ TREND_EVIDENCE_COLUMNS = (
     "raw_metadata",
 )
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Structured Threads pk shape: numeric id, optionally compound with : . _ -
+# separators (e.g. "1788000000000001" or "555:1788000000000001").
+_PK_RE = re.compile(r"^[0-9][0-9:._-]*$")
 
 
 def trend_candidate_payload(
@@ -452,6 +455,49 @@ class SupabaseStore:
                 "id": f"eq.{candidate_id}",
                 "target_account_id": f"eq.{account_key}",
             },
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    def update_trend_candidate_source_post_id(
+        self, *, candidate_id: int, source_post_id: str
+    ) -> dict[str, Any] | None:
+        """Allowlisted factual UPDATE: writes ONLY ``source_post_id``.
+
+        Account-scoped twice over: PATCH filters on id AND
+        target_account_id, and the filtered row is returned for inspection.
+        Deliberately cannot touch status, analysis fields, views, engagement
+        counters, or raw_metadata — the body is constructed here from a
+        single validated value. Fails closed on malformed input; returns
+        None (no error) when the account-scoped filter matches no row.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        if not isinstance(source_post_id, str) or not source_post_id.strip():
+            raise ValueError("source_post_id must be a non-blank string")
+        pk = source_post_id.strip()
+        if not _PK_RE.fullmatch(pk) or not any(ch.isdigit() for ch in pk):
+            raise ValueError(
+                "source_post_id must look like a structured pk "
+                "(digits with optional :._- separators)"
+            )
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+            json={"source_post_id": source_post_id.strip()},
         )
         response.raise_for_status()
         rows = response.json() or []

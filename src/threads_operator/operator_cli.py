@@ -22,6 +22,7 @@ from .publisher import publish_next
 from .safe_errors import redact_error
 from .supabase_store import SupabaseStore, TREND_STATUSES, trend_candidate_payload
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
+from .trend_urls import normalize_threads_post_url
 
 _EXECUTION_MODES = {"draft_only", "approval_required", "auto_post"}
 
@@ -88,6 +89,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     trend_show.add_argument("--account")
     trend_show.add_argument("--id", type=int, required=True)
+    trend_enrich_p = trend_sub.add_parser(
+        "enrich",
+        help=(
+            "Read-only browser enrichment: structured preloader evidence -> "
+            "factual source_post_id update (allowlisted, account-scoped)"
+        ),
+    )
+    trend_enrich_p.add_argument("--account")
+    trend_enrich_p.add_argument("--id", type=int, help="candidate id (live mode)")
+    trend_enrich_p.add_argument("--url", help="permalink (required with --dry-run)")
+    trend_enrich_p.add_argument("--dry-run", action="store_true")
+    trend_enrich_p.add_argument("--settle", type=float, default=3.0)
 
     return parser
 
@@ -334,6 +347,52 @@ def _run_trend_show(config: AccountConfig, *, candidate_id: int) -> tuple[int, d
     }
 
 
+def _run_trend_enrich(
+    config: AccountConfig,
+    *,
+    candidate_id: int | None,
+    url: str | None,
+    dry_run: bool,
+    settle: float,
+) -> tuple[int, dict[str, Any]]:
+    """Deterministic read-only browser enrichment (v1: source_post_id only).
+
+    Dry-run NEVER constructs a store; live mode only PATCHs the single
+    allowlisted factual field through the account-scoped store method.
+    """
+    from .trend_enrich import enrich_candidate, enrich_permalink_dry_run
+
+    profile_raw = config.get("THREADS_BROWSER_PROFILE", "") or ""
+    if not profile_raw:
+        raise AccountConfigError(
+            "THREADS_BROWSER_PROFILE is required for trend enrichment")
+    profile_dir = Path(profile_raw).expanduser()
+
+    if dry_run:
+        if not url:
+            raise AccountConfigError("--url is required with --dry-run")
+        permalink, _username = normalize_threads_post_url(url)
+        result = enrich_permalink_dry_run(
+            permalink=permalink, profile_dir=profile_dir, settle_seconds=settle)
+        return 0, {"ok": True, "account": config.name, **result}
+
+    if candidate_id is None:
+        raise AccountConfigError("--id is required for a live enrich")
+    result = enrich_candidate(
+        _store(config),
+        candidate_id=candidate_id,
+        profile_dir=profile_dir,
+        settle_seconds=settle,
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "dry_run": False,
+        "writes": 1 if result["updated"] else 0,
+        **result,
+    }
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -385,6 +444,14 @@ def main(
             )
         elif args.command == "trend" and args.trend_command == "show":
             code, payload = _run_trend_show(config, candidate_id=args.id)
+        elif args.command == "trend" and args.trend_command == "enrich":
+            code, payload = _run_trend_enrich(
+                config,
+                candidate_id=args.id,
+                url=args.url,
+                dry_run=args.dry_run,
+                settle=args.settle,
+            )
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:
