@@ -92,6 +92,28 @@ CANDIDATE = {
 }
 
 
+# ------------------------------------------------- numeric-permalink refusal
+def test_numeric_candidate_fails_closed_without_bridge(stub_reader, monkeypatch):
+    """A (legacy) candidate whose permalink is still a numeric fbid cannot
+    be enriched by the shortcode extractor — it must fail closed, writing
+    nothing, rather than match on anything fuzzy."""
+    from pathlib import Path
+
+    numeric = dict(CANDIDATE, id=2, source_permalink=(
+        "https://www.threads.com/@syaqir_sharani/post/17909304312530892"))
+    store = RecordingStore(numeric)
+
+    def fake_read(profile_dir, permalink, *, settle_seconds=3.0):
+        return _facts_doc()  # doc contains only the shortcode post
+
+    monkeypatch.setattr(trend_enrich, "read_post_document_sync", fake_read)
+    with pytest.raises(TrendEnrichError):
+        trend_enrich.enrich_candidate(store, candidate_id=2,
+                                      profile_dir=Path("/tmp/whatever"))
+    assert store.evidence_calls == []
+    assert store.pk_calls == []
+
+
 # ------------------------------------------------------------- orchestration
 
 def test_live_enrich_sends_broad_evidence_patch(stub_reader):

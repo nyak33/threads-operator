@@ -92,6 +92,31 @@ class ThreadsAPI:
             )
         return posts
 
+    def get_post_identity(self, post_id: str) -> dict[str, Any]:
+        """Fetch {id, permalink, username} for ONE post by its numeric id.
+
+        Official Graph API only (base URL is host-validated to
+        graph.threads.net). Used by Activity-candidate ingress to bridge a
+        numeric fbid permalink to its canonical shortcode permalink. Raises
+        ValueError unless the response echoes the exact requested id — a
+        mismatched echo means the identity is NOT proven (fail closed).
+        """
+        post_id = str(post_id or "").strip()
+        if not post_id.isdigit():
+            raise ValueError("post_id must be a numeric Threads media id")
+        response = self.client.get(
+            f"{self.base_url}/{post_id}",
+            params=self._params({"fields": "id,permalink,username"}),
+        )
+        response.raise_for_status()
+        data = response.json() or {}
+        if str(data.get("id") or "") != post_id:
+            raise ValueError(
+                "Threads API identity echo mismatch — refusing unproven id")
+        if not data.get("permalink"):
+            raise ValueError("Threads API returned no permalink for this id")
+        return data
+
     def get_post_insights(self, post_id: str) -> dict[str, int | float | None]:
         return self._get_insights(
             f"{self.base_url}/{post_id}/insights",

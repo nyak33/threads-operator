@@ -168,11 +168,22 @@ _EVIDENCE_VALIDATORS: dict[str, Any] = {
 }
 
 
+TREND_CANDIDATE_ROLES = {
+    # Logical roles inside the ONE candidates table (no schema change):
+    # external_trend     - manually added public posts (original path)
+    # own_performance    - Activity-attributed posts from this account
+    "external_trend": {"manual": True, "discovery_method": "manual_url"},
+    "own_performance": {"manual": False,
+                        "discovery_method": "activity_attribution"},
+}
+
+
 def trend_candidate_payload(
     account_key: str,
     url: str,
     *,
     now: str | None = None,
+    candidate_role: str = "external_trend",
     source_username: str | None = None,
     source_text: str | None = None,
     published_at: str | None = None,
@@ -188,18 +199,28 @@ def trend_candidate_payload(
     Shared by the live store insert and the CLI dry-run preview so both
     render the exact same sanitized shape. Analysis fields (topic, tone,
     trend_score, ...) are intentionally never set here.
+
+    candidate_role selects the raw_metadata role facts:
+    external_trend => manual=true/manual_url (historical shape, unchanged);
+    own_performance => manual=false/activity_attribution. Unknown roles are
+    rejected before any write.
     """
     permalink, username = normalize_threads_post_url(url)
     if not account_key:
         raise ValueError("account_key is required for trend candidate writes")
+    if candidate_role not in TREND_CANDIDATE_ROLES:
+        raise ValueError(
+            "candidate_role must be one of: "
+            + ", ".join(sorted(TREND_CANDIDATE_ROLES)))
+    role_meta = TREND_CANDIDATE_ROLES[candidate_role]
     payload: dict[str, Any] = {
         "target_account_id": account_key,
         "source_platform": "threads",
         "source_permalink": permalink,
         "discovered_at": now or SupabaseStore._utc_now(),
         "raw_metadata": {
-            "manual": True,
-            "discovery_method": "manual_url",
+            "candidate_role": candidate_role,
+            **role_meta,
             **(raw_metadata or {}),
         },
     }
@@ -376,6 +397,7 @@ class SupabaseStore:
         self,
         url: str,
         *,
+        candidate_role: str = "external_trend",
         source_username: str | None = None,
         source_text: str | None = None,
         published_at: str | None = None,
@@ -423,6 +445,7 @@ class SupabaseStore:
         payload = trend_candidate_payload(
             account_key,
             url,
+            candidate_role=candidate_role,
             source_username=source_username,
             source_text=source_text,
             published_at=published_at,
