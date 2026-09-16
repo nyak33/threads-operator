@@ -20,7 +20,7 @@ from .activity_collector import collect_activity_follows
 from .collector import collect_once
 from .publisher import publish_next
 from .safe_errors import redact_error
-from .supabase_store import SupabaseStore
+from .supabase_store import SupabaseStore, trend_candidate_payload
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
 
 _EXECUTION_MODES = {"draft_only", "approval_required", "auto_post"}
@@ -63,6 +63,20 @@ def _parser() -> argparse.ArgumentParser:
     publish = sub.add_parser("publish", help="Publish one approved due queue item")
     publish.add_argument("--account")
     publish.add_argument("--dry-run", action="store_true")
+
+    trend = sub.add_parser(
+        "trend", help="Manage trend content-discovery candidates"
+    )
+    trend_sub = trend.add_subparsers(dest="trend_command", required=True)
+    trend_add = trend_sub.add_parser(
+        "add",
+        help="Manually add a public Threads post URL as a trend candidate",
+    )
+    trend_add.add_argument("--account")
+    trend_add.add_argument("--url", required=True)
+    trend_add.add_argument("--text")
+    trend_add.add_argument("--username")
+    trend_add.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -248,6 +262,41 @@ def _run_publish(
     return (1 if result.get("status") == "failed" else 0), result
 
 
+def _run_trend_add(
+    config: AccountConfig,
+    *,
+    url: str,
+    text: str | None,
+    username: str | None,
+    dry_run: bool,
+) -> tuple[int, dict[str, Any]]:
+    # The selected --account is authoritative: target_account_id always comes
+    # from config.name; there is no flag to override it.
+    candidate = trend_candidate_payload(
+        config.name,
+        url,
+        source_username=username,
+        source_text=text,
+    )
+    if dry_run:
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "dry_run": True,
+            "writes": 0,
+            "candidate": candidate,
+        }
+    result = _store(config).insert_trend_candidate(
+        url, source_username=username, source_text=text
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "dry_run": False,
+        **result,
+    }
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -282,6 +331,14 @@ def main(
             )
         elif args.command == "publish":
             code, payload = _run_publish(config, dry_run=args.dry_run)
+        elif args.command == "trend" and args.trend_command == "add":
+            code, payload = _run_trend_add(
+                config,
+                url=args.url,
+                text=args.text,
+                username=args.username,
+                dry_run=args.dry_run,
+            )
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:

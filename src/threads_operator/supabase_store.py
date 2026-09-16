@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .threads_api import POST_METRICS, has_usable_metrics
+from .trend_urls import normalize_threads_post_url
 
 # Supabase gateway blips (project-level latency spikes) return 502/503/504 on
 # otherwise-valid GETs. Idempotent reads retry with exponential backoff so one
@@ -71,7 +72,63 @@ ACCOUNT_TABLE = "threads_account_insights_snapshots"
 POST_TABLE = "threads_post_insights_snapshots"
 ACTIVITY_EVENTS_TABLE = "threads_activity_events"
 OWN_POSTS_TABLE = "threads_posts"
+TREND_CANDIDATES_TABLE = "threads_trend_candidates"
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def trend_candidate_payload(
+    account_key: str,
+    url: str,
+    *,
+    now: str | None = None,
+    source_username: str | None = None,
+    source_text: str | None = None,
+    published_at: str | None = None,
+    views: int | None = None,
+    likes: int | None = None,
+    replies: int | None = None,
+    reposts: int | None = None,
+    quotes: int | None = None,
+    raw_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the deterministic insert payload for one trend candidate.
+
+    Shared by the live store insert and the CLI dry-run preview so both
+    render the exact same sanitized shape. Analysis fields (topic, tone,
+    trend_score, ...) are intentionally never set here.
+    """
+    permalink, username = normalize_threads_post_url(url)
+    if not account_key:
+        raise ValueError("account_key is required for trend candidate writes")
+    payload: dict[str, Any] = {
+        "target_account_id": account_key,
+        "source_platform": "threads",
+        "source_permalink": permalink,
+        "discovered_at": now or SupabaseStore._utc_now(),
+        "raw_metadata": {
+            "manual": True,
+            "discovery_method": "manual_url",
+            **(raw_metadata or {}),
+        },
+    }
+    if username:
+        payload["source_username"] = username
+    if source_username:
+        payload["source_username"] = source_username
+    if source_text:
+        payload["source_text"] = source_text
+    if published_at:
+        payload["published_at"] = published_at
+    for name, value in (
+        ("views", views),
+        ("likes", likes),
+        ("replies", replies),
+        ("reposts", reposts),
+        ("quotes", quotes),
+    ):
+        if value is not None:
+            payload[name] = int(value)
+    return payload
 
 
 class SupabaseStore:
@@ -222,6 +279,90 @@ class SupabaseStore:
         )
         response.raise_for_status()
         return len(new_payloads)
+
+    def insert_trend_candidate(
+        self,
+        url: str,
+        *,
+        source_username: str | None = None,
+        source_text: str | None = None,
+        published_at: str | None = None,
+        views: int | None = None,
+        likes: int | None = None,
+        replies: int | None = None,
+        reposts: int | None = None,
+        quotes: int | None = None,
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Deterministically insert one public Threads post as a trend candidate.
+
+        target_account_id is ALWAYS derived from self.account_key — callers
+        cannot cross-write another account. Dedup uses the live unique
+        identity (target_account_id, source_permalink); an existing row
+        returns status="existing" with no second insert. source_post_id is
+        left unset (NULL) — never fabricated from the permalink code.
+        """
+        permalink, _username = normalize_threads_post_url(url)
+        account_key = self._require_account_key()
+
+        def _lookup() -> dict[str, Any] | None:
+            response = self.client.get(
+                f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+                headers=self._headers,
+                params={
+                    "target_account_id": f"eq.{account_key}",
+                    "source_permalink": f"eq.{permalink}",
+                    "select": "id,status",
+                    "limit": "1",
+                },
+            )
+            response.raise_for_status()
+            rows = response.json() or []
+            return rows[0] if rows else None
+
+        found = _lookup()
+        if found:
+            return {
+                "status": "existing",
+                "id": found.get("id"),
+                "permalink": permalink,
+            }
+
+        payload = trend_candidate_payload(
+            account_key,
+            url,
+            source_username=source_username,
+            source_text=source_text,
+            published_at=published_at,
+            views=views,
+            likes=likes,
+            replies=replies,
+            reposts=reposts,
+            quotes=quotes,
+            raw_metadata=raw_metadata,
+        )
+
+        headers = {**self._headers, "Prefer": "return=representation"}
+        response = self.client.post(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=headers,
+            json=payload,
+        )
+        if response.status_code == 409:
+            # Lost a race against an identical insert: the row exists now.
+            found = _lookup()
+            return {
+                "status": "existing",
+                "id": (found or {}).get("id"),
+                "permalink": permalink,
+            }
+        response.raise_for_status()
+        rows = response.json() or []
+        return {
+            "status": "inserted",
+            "id": rows[0].get("id") if rows else None,
+            "permalink": permalink,
+        }
 
     def list_posts(self) -> list[dict[str, Any]]:
         response = self.client.get(
