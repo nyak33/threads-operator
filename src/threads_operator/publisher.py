@@ -80,6 +80,30 @@ def _recovery_deadline(row: dict[str, Any]) -> datetime | None:
     return scheduled + RECOVERY_WINDOW
 
 
+def _with_queue_context(
+    diagnostics: dict[str, Any],
+    *,
+    store: SupabaseStore,
+    row: dict[str, Any],
+    row_id: object,
+    campaign_code: str | None,
+    current: datetime,
+    attempt_number: int,
+) -> dict[str, Any]:
+    enriched = dict(diagnostics)
+    enriched.update(
+        {
+            "timestamp": _iso(current),
+            "account_key": getattr(store, "account_key", None),
+            "campaign_code": campaign_code or row.get("campaign_code"),
+            "queue_row_id": row_id,
+            "scheduled_at": row.get("scheduled_at"),
+            "attempt_number": attempt_number,
+        }
+    )
+    return enriched
+
+
 def publish_next(
     api: ThreadsAPI,
     store: SupabaseStore,
@@ -121,14 +145,22 @@ def publish_next(
     if row_id is None:
         raise ValueError("Claimed queue row is missing id")
 
+    existing_attempts = int(row.get("attempt_count") or 0)
     deadline = _recovery_deadline(row)
     if deadline is not None and current >= deadline:
         error = "Automatic publish recovery window expired before publish attempt"
-        diagnostics = {
-            "classification": "recovery_window_expired",
-            "scheduled_at": row.get("scheduled_at"),
-            "retry_deadline_at": _iso(deadline),
-        }
+        diagnostics = _with_queue_context(
+            {
+                "classification": "recovery_window_expired",
+                "retry_deadline_at": _iso(deadline),
+            },
+            store=store,
+            row=row,
+            row_id=row_id,
+            campaign_code=campaign_code,
+            current=current,
+            attempt_number=existing_attempts,
+        )
         store.mark_post_needs_attention(table, row_id, error, diagnostics)
         return {
             "status": "needs_attention",
@@ -164,6 +196,16 @@ def publish_next(
         }
     except Exception as exc:
         error, diagnostics, retryable = _error_details(exc)
+        failure_attempt = existing_attempts + 1
+        diagnostics = _with_queue_context(
+            diagnostics,
+            store=store,
+            row=row,
+            row_id=row_id,
+            campaign_code=campaign_code,
+            current=current,
+            attempt_number=failure_attempt,
+        )
 
         # Once the main post exists, blind queue-level retry could duplicate it.
         # Preserve the existing conservative manual-reconciliation behavior.
@@ -187,12 +229,18 @@ def publish_next(
 
         if retryable is True:
             effective_deadline = deadline or (current + RECOVERY_WINDOW)
-            attempt_count = int(row.get("attempt_count") or 0) + 1
+            attempt_count = failure_attempt
 
             if current < effective_deadline:
                 next_retry = min(
                     current + timedelta(seconds=_retry_delay(attempt_count)),
                     effective_deadline,
+                )
+                diagnostics.update(
+                    {
+                        "next_retry_at": _iso(next_retry),
+                        "retry_deadline_at": _iso(effective_deadline),
+                    }
                 )
                 try:
                     store.mark_post_retrying(
@@ -220,6 +268,7 @@ def publish_next(
                     "diagnostics": diagnostics,
                 }
 
+            diagnostics["retry_deadline_at"] = _iso(effective_deadline)
             try:
                 store.mark_post_needs_attention(table, row_id, error, diagnostics)
             except Exception as persistence_exc:
