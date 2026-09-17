@@ -9,17 +9,34 @@ NOW = "2026-09-15T04:00:00+00:00"
 
 
 def test_peek_due_post_is_scoped_to_account_and_optional_campaign():
+    seen_statuses = []
+
     def handler(request):
         assert request.method == "GET"
         assert request.url.path == "/rest/v1/custom_queue"
         params = request.url.params
         assert params["account_key"] == "eq.brand_a"
-        assert params["status"] == "eq.approved"
-        assert params["scheduled_at"] == f"lte.{NOW}"
         assert params["campaign_code"] == "eq.RANDOM_LIFE"
         assert params["order"] == "scheduled_at.asc,id.asc"
         assert params["limit"] == "1"
-        return httpx.Response(200, json=[{"id": 7, "main_post_text": "hello"}])
+        seen_statuses.append(params["status"])
+        if params["status"] == "eq.approved":
+            assert params["scheduled_at"] == f"lte.{NOW}"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 7,
+                        "status": "approved",
+                        "scheduled_at": "2026-09-15T03:59:00+00:00",
+                        "main_post_text": "hello",
+                    }
+                ],
+            )
+        assert params["status"] == "eq.retrying"
+        assert params["next_retry_at"] == f"lte.{NOW}"
+        assert params["retry_deadline_at"] == f"gt.{NOW}"
+        return httpx.Response(200, json=[])
 
     store = SupabaseStore(
         "https://example.supabase.co",
@@ -29,6 +46,7 @@ def test_peek_due_post_is_scoped_to_account_and_optional_campaign():
     )
     row = store.peek_due_post("custom_queue", campaign_code="RANDOM_LIFE", now=NOW)
     assert row["id"] == 7
+    assert seen_statuses == ["eq.approved", "eq.retrying"]
 
 
 def test_enqueue_draft_writes_only_account_scoped_draft_content():
@@ -70,7 +88,19 @@ def test_claim_due_post_uses_conditional_patch_and_returns_claimed_row():
     def handler(request):
         calls.append(request)
         if request.method == "GET":
-            return httpx.Response(200, json=[{"id": 7, "main_post_text": "hello"}])
+            if request.url.params["status"] == "eq.approved":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": 7,
+                            "status": "approved",
+                            "scheduled_at": "2026-09-15T03:59:00+00:00",
+                            "main_post_text": "hello",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
         if request.method == "PATCH":
             params = request.url.params
             assert params["id"] == "eq.7"
@@ -94,13 +124,25 @@ def test_claim_due_post_uses_conditional_patch_and_returns_claimed_row():
     )
     claimed = store.claim_due_post("custom_queue", now=NOW)
     assert claimed["status"] == "posting"
-    assert [request.method for request in calls] == ["GET", "PATCH"]
+    assert [request.method for request in calls] == ["GET", "GET", "PATCH"]
 
 
 def test_claim_due_post_returns_none_when_another_worker_won():
     def handler(request):
         if request.method == "GET":
-            return httpx.Response(200, json=[{"id": 7, "main_post_text": "hello"}])
+            if request.url.params["status"] == "eq.approved":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": 7,
+                            "status": "approved",
+                            "scheduled_at": "2026-09-15T03:59:00+00:00",
+                            "main_post_text": "hello",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
         return httpx.Response(200, json=[])
 
     store = SupabaseStore(
@@ -138,6 +180,9 @@ def test_mark_post_states_remain_account_scoped():
     assert patches[2]["threads_reply_ids"] == ["reply-1"]
     assert patches[2]["posted_at"] == NOW
     assert patches[2]["last_error"] is None
+    assert patches[2]["last_error_meta"] is None
+    assert patches[2]["next_retry_at"] is None
+    assert patches[2]["retry_deadline_at"] is None
     assert patches[3] == {"status": "failed", "last_error": "boom"}
 
 
