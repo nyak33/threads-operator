@@ -191,7 +191,7 @@ def test_peek_due_post_considers_retrying_rows_when_retry_time_is_due():
             return httpx.Response(200, json=[])
         assert status == "eq.retrying"
         assert request.url.params["next_retry_at"] == "lte.2026-09-17T06:05:00+00:00"
-        assert request.url.params["retry_deadline_at"] == "gt.2026-09-17T06:05:00+00:00"
+        assert "retry_deadline_at" not in request.url.params
         return httpx.Response(
             200,
             json=[
