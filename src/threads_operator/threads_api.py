@@ -216,7 +216,9 @@ class ThreadsAPI:
         except httpx.TransportError as exc:
             raise ThreadsPublishTransportError(exc) from exc
         if response.is_error:
-            raise _publish_error(response)
+            error = _publish_error(response)
+            error.diagnostics["container_id"] = str(creation_id)
+            raise error
         post_id = response.json().get("id")
         if not post_id:
             raise ValueError("Threads publish response did not include id")
@@ -241,6 +243,10 @@ class ThreadsAPI:
             creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
         except httpx.TransportError as exc:
             raise ThreadsPublishTransportError(exc) from exc
+        except httpx.HTTPStatusError as exc:
+            # Container creation is part of the same publish transaction. Classify
+            # Meta HTTP failures consistently so the queue can recover them too.
+            raise _publish_error(exc.response) from exc
         for attempt in range(max_attempts):
             try:
                 return self.publish_container(creation_id)
