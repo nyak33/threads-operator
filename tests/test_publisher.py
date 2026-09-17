@@ -1,4 +1,9 @@
+from datetime import datetime, timezone
+
 from threads_operator.publisher import publish_next
+
+
+NOW = datetime(2026, 9, 17, 6, 1, tzinfo=timezone.utc)
 
 
 class FakeStore:
@@ -191,7 +196,7 @@ def test_retryable_main_publish_failure_is_requeued_instead_of_terminal_failed()
     store = FakeStore(row())
     api = FakeAPI(fail_at=1, fail_exc=RetryablePublishError("temporary Meta failure"))
 
-    result = publish_next(api, store, "queue")
+    result = publish_next(api, store, "queue", now=NOW)
 
     assert result["status"] == "retrying"
     assert result["queue_id"] == 7
@@ -206,10 +211,29 @@ def test_permanent_main_publish_failure_requires_attention_without_retrying():
     store = FakeStore(row())
     api = FakeAPI(fail_at=1, fail_exc=PermanentPublishError("invalid token"))
 
-    result = publish_next(api, store, "queue")
+    result = publish_next(api, store, "queue", now=NOW)
 
     assert result["status"] == "needs_attention"
     attention = [call for call in store.calls if call[0] == "needs-attention"]
     assert len(attention) == 1
     assert attention[0][4]["error_code"] == 190
     assert not [call for call in store.calls if call[0] == "retrying"]
+
+
+def test_retryable_failure_after_30_minute_deadline_requires_attention():
+    retry_row = row()
+    retry_row["retry_deadline_at"] = "2026-09-17T06:30:00+00:00"
+    retry_row["attempt_count"] = 5
+    store = FakeStore(retry_row)
+    api = FakeAPI(fail_at=1, fail_exc=RetryablePublishError("temporary Meta failure"))
+
+    result = publish_next(
+        api,
+        store,
+        "queue",
+        now=datetime(2026, 9, 17, 6, 30, tzinfo=timezone.utc),
+    )
+
+    assert result["status"] == "needs_attention"
+    assert not [call for call in store.calls if call[0] == "retrying"]
+    assert len([call for call in store.calls if call[0] == "needs-attention"]) == 1
