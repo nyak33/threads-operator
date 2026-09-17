@@ -285,22 +285,31 @@ class SupabaseStore:
             raise ValueError("Draft insert did not return a queue row")
         return rows[0]
 
-    def peek_due_post(
+    def _peek_queue_status(
         self,
         table: str,
-        campaign_code: str | None = None,
         *,
-        now: str | None = None,
+        status: str,
+        now: str,
+        campaign_code: str | None,
     ) -> dict[str, Any] | None:
         account_key = self._require_account_key()
-        params = {
+        params: dict[str, str] = {
             "account_key": f"eq.{account_key}",
-            "status": "eq.approved",
-            "scheduled_at": f"lte.{now or self._utc_now()}",
+            "status": f"eq.{status}",
             "order": "scheduled_at.asc,id.asc",
             "limit": "1",
             "select": "*",
         }
+        if status == "approved":
+            params["scheduled_at"] = f"lte.{now}"
+        elif status == "retrying":
+            # Do not filter by retry_deadline_at here. Expired retry rows must
+            # still be claimable so publisher.py can transition them to
+            # needs_attention instead of leaving them stuck forever.
+            params["next_retry_at"] = f"lte.{now}"
+        else:
+            raise ValueError(f"Unsupported due queue status: {status}")
         if campaign_code:
             params["campaign_code"] = f"eq.{campaign_code}"
         response = self.client.get(
@@ -309,6 +318,40 @@ class SupabaseStore:
         response.raise_for_status()
         rows = response.json() or []
         return rows[0] if rows else None
+
+    @staticmethod
+    def _queue_sort_key(row: dict[str, Any]) -> tuple[str, int]:
+        scheduled = str(row.get("scheduled_at") or "")
+        try:
+            row_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        return scheduled, row_id
+
+    def peek_due_post(
+        self,
+        table: str,
+        campaign_code: str | None = None,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any] | None:
+        due_at = now or self._utc_now()
+        approved = self._peek_queue_status(
+            table,
+            status="approved",
+            now=due_at,
+            campaign_code=campaign_code,
+        )
+        retrying = self._peek_queue_status(
+            table,
+            status="retrying",
+            now=due_at,
+            campaign_code=campaign_code,
+        )
+        candidates = [row for row in (approved, retrying) if row]
+        if not candidates:
+            return None
+        return min(candidates, key=self._queue_sort_key)
 
     def claim_due_post(
         self,
@@ -327,6 +370,9 @@ class SupabaseStore:
         row_id = candidate.get("id")
         if row_id is None:
             raise ValueError("Queue row is missing id")
+        candidate_status = str(candidate.get("status") or "approved")
+        if candidate_status not in {"approved", "retrying"}:
+            raise ValueError(f"Queue row has non-claimable status: {candidate_status}")
         headers = {**self._headers, "Prefer": "return=representation"}
         response = self.client.patch(
             self._queue_url(table),
@@ -334,7 +380,7 @@ class SupabaseStore:
             params={
                 "id": f"eq.{row_id}",
                 "account_key": f"eq.{account_key}",
-                "status": "eq.approved",
+                "status": f"eq.{candidate_status}",
             },
             json={"status": "posting", "claimed_at": claimed_at},
         )
@@ -369,6 +415,47 @@ class SupabaseStore:
             table, row_id, {"threads_reply_ids": list(reply_ids)}
         )
 
+    def mark_post_retrying(
+        self,
+        table: str,
+        row_id: int | str,
+        error: str,
+        diagnostics: dict[str, Any],
+        next_retry_at: str,
+        retry_deadline_at: str,
+        attempt_count: int,
+    ) -> None:
+        self._patch_queue_row(
+            table,
+            row_id,
+            {
+                "status": "retrying",
+                "last_error": str(error)[:2000],
+                "last_error_meta": dict(diagnostics),
+                "next_retry_at": next_retry_at,
+                "retry_deadline_at": retry_deadline_at,
+                "attempt_count": int(attempt_count),
+            },
+        )
+
+    def mark_post_needs_attention(
+        self,
+        table: str,
+        row_id: int | str,
+        error: str,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        self._patch_queue_row(
+            table,
+            row_id,
+            {
+                "status": "needs_attention",
+                "last_error": str(error)[:2000],
+                "last_error_meta": dict(diagnostics or {}),
+                "next_retry_at": None,
+            },
+        )
+
     def mark_post_posted(
         self,
         table: str,
@@ -385,6 +472,9 @@ class SupabaseStore:
                 "threads_reply_ids": list(reply_ids),
                 "posted_at": posted_at or self._utc_now(),
                 "last_error": None,
+                "last_error_meta": None,
+                "next_retry_at": None,
+                "retry_deadline_at": None,
             },
         )
 

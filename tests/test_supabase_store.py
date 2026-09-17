@@ -179,3 +179,43 @@ def test_latest_post_snapshots_paginates_large_result_sets():
 
     assert offsets == [0, 2]
     assert set(latest) == {"p1", "p2", "p3"}
+
+
+def test_peek_due_post_considers_retrying_rows_when_retry_time_is_due():
+    statuses = []
+
+    def handler(request):
+        status = request.url.params["status"]
+        statuses.append(status)
+        if status == "eq.approved":
+            return httpx.Response(200, json=[])
+        assert status == "eq.retrying"
+        assert request.url.params["next_retry_at"] == "lte.2026-09-17T06:05:00+00:00"
+        assert "retry_deadline_at" not in request.url.params
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 7,
+                    "account_key": "syaqir",
+                    "status": "retrying",
+                    "scheduled_at": "2026-09-17T06:00:00+00:00",
+                    "next_retry_at": "2026-09-17T06:04:00+00:00",
+                    "retry_deadline_at": "2026-09-17T06:30:00+00:00",
+                }
+            ],
+        )
+
+    store = SupabaseStore(
+        "https://example.supabase.co",
+        "secret",
+        client=make_client(handler),
+        account_key="syaqir",
+    )
+    found = store.peek_due_post(
+        "threads_publish_queue",
+        now="2026-09-17T06:05:00+00:00",
+    )
+
+    assert found["id"] == 7
+    assert statuses == ["eq.approved", "eq.retrying"]

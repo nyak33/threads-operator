@@ -237,15 +237,21 @@ def _run_publish(
         }
     table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
     campaign = config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
+    api = _api(config)
+    if not dry_run:
+        # Public publishing is a capability granted only after the existing
+        # account-level live-post gates pass. Dry-run never receives it.
+        api.enable_publishing()
     result = publish_next(
-        _api(config),
+        api,
         _store(config),
         table,
         campaign_code=campaign,
         dry_run=dry_run,
     )
     result = {"account": config.name, **result}
-    return (1 if result.get("status") == "failed" else 0), result
+    terminal_failure = result.get("status") in {"failed", "needs_attention"}
+    return (1 if terminal_failure else 0), result
 
 
 def main(
