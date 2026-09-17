@@ -304,8 +304,10 @@ class SupabaseStore:
         if status == "approved":
             params["scheduled_at"] = f"lte.{now}"
         elif status == "retrying":
+            # Do not filter by retry_deadline_at here. Expired retry rows must
+            # still be claimable so publisher.py can transition them to
+            # needs_attention instead of leaving them stuck forever.
             params["next_retry_at"] = f"lte.{now}"
-            params["retry_deadline_at"] = f"gt.{now}"
         else:
             raise ValueError(f"Unsupported due queue status: {status}")
         if campaign_code:
