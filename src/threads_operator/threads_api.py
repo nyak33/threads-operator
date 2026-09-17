@@ -60,6 +60,24 @@ class ThreadsPublishError(httpx.HTTPStatusError):
         self.diagnostics = diagnostics
 
 
+class ThreadsPublishTransportError(RuntimeError):
+    """Retryable network/transport failure during a publish transaction."""
+
+    retryable = True
+
+    def __init__(self, exc: httpx.TransportError) -> None:
+        super().__init__(f"Threads publish transport failure: {type(exc).__name__}: {exc}")
+        self.diagnostics = {
+            "http_status": None,
+            "error_message": str(exc),
+            "error_type": type(exc).__name__,
+            "error_code": None,
+            "error_subcode": None,
+            "fbtrace_id": None,
+            "classification": "transport",
+        }
+
+
 def has_usable_metrics(row: dict[str, Any]) -> bool:
     """Return True when at least one core post metric is present, including zero."""
     return any(row.get(name) is not None for name in POST_METRICS)
@@ -187,13 +205,16 @@ class ThreadsAPI:
         self._require_publishing_allowed()
         if not creation_id:
             raise ValueError("Threads creation id is required")
-        response = self.client.post(
-            f"{self.base_url}/{self.user_id}/threads_publish",
-            data={
-                "access_token": self.access_token,
-                "creation_id": str(creation_id),
-            },
-        )
+        try:
+            response = self.client.post(
+                f"{self.base_url}/{self.user_id}/threads_publish",
+                data={
+                    "access_token": self.access_token,
+                    "creation_id": str(creation_id),
+                },
+            )
+        except httpx.TransportError as exc:
+            raise ThreadsPublishTransportError(exc) from exc
         if response.is_error:
             raise _publish_error(response)
         post_id = response.json().get("id")
@@ -216,7 +237,10 @@ class ThreadsAPI:
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
-        creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
+        try:
+            creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
+        except httpx.TransportError as exc:
+            raise ThreadsPublishTransportError(exc) from exc
         for attempt in range(max_attempts):
             try:
                 return self.publish_container(creation_id)
