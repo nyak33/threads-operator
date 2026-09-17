@@ -75,6 +75,7 @@ For a fresh database, apply the repository migrations in filename order that are
 4. `migrations/004_threads_publish_queue.sql` if queue publishing or draft ingress is enabled
 5. `migrations/005_activity_multi_account_upgrade.sql` may also be applied; it is designed to be harmless when the fresh account-scoped Activity schema already exists.
 6. `migrations/006_security_hardening.sql` to remove client-role access from operator-owned Insights tables and retain service-role access.
+7. `migrations/007_publish_recovery.sql` for bounded automatic publishing recovery, retry metadata and the `retrying` / `needs_attention` queue states.
 
 For an existing deployment, apply any not-yet-applied forward migrations. Do not drop production tables just to reach the latest schema.
 
@@ -137,7 +138,7 @@ THREADS_POSTING_ENABLED=true
 THREADS_EXECUTION_MODE=auto_post
 ```
 
-Credentials alone never enable live posting.
+Credentials alone never enable live posting. Internally, the public `threads_publish` capability is granted only after these live-post gates pass. Dry-run and ordinary diagnostic use never receive that capability.
 
 ## 8. Optional Hermes Content Generation
 
@@ -180,11 +181,33 @@ If Hermes generates content for several accounts, generation jobs must also pass
 
 The generic queue is `threads_publish_queue` unless an account overrides `THREADS_QUEUE_TABLE`.
 
-New content may enter as `draft`. Draft ingress never promotes it automatically. Only rows for the selected `account_key` are eligible for publishing, and by default only `status=approved` rows whose `scheduled_at` is due can be claimed. An optional campaign code further narrows the queue.
+New content may enter as `draft`. Draft ingress never promotes it automatically. Only rows for the selected `account_key` are eligible for publishing. `approved` rows become eligible only when `scheduled_at <= now`; an optional campaign code can further narrow the queue.
 
-The worker conditionally claims `approved -> posting` before calling Threads. The main Threads post ID is persisted before optional replies are attempted. Completed work becomes `posted`; visible partial failures become `failed` and retain known post IDs for reconciliation.
+For near-scheduled posting, run the deterministic queue worker every minute. A post scheduled for 06:00 should therefore normally be picked up around 06:00–06:01. The worker never deliberately publishes before `scheduled_at`.
+
+The worker conditionally claims `approved -> posting` before calling Threads. On success, the main Threads post ID is persisted before optional replies are attempted and completed work becomes `posted`.
+
+### Automatic recovery
+
+Retryable failures before a main post ID is confirmed do **not** become terminal immediately:
+
+```text
+approved -> posting -> retrying -> posting -> posted
+```
+
+The recovery window is bounded to 30 minutes from the original `scheduled_at`. Each retry is persisted with `attempt_count`, `next_retry_at`, `retry_deadline_at` and credential-safe structured Meta diagnostics in `last_error_meta`.
+
+A queue-level retry starts a fresh publish transaction, so a failed main-post container is not blindly reused. Container-readiness errors may be retried briefly inside one transaction; broader transient failures return to the queue and use a fresh container on the next attempt.
+
+Examples treated as retryable include transport/network errors, HTTP 429, Meta 5xx and generic/unknown publish HTTP 400 responses that are not clearly permanent. Unknown 400s are bounded by the same 30-minute window rather than being retried forever.
+
+Clearly permanent failures such as invalid OAuth/token state, revoked permission, account/app restriction, unsupported operation or clearly invalid parameters move to `needs_attention` without consuming the full recovery window.
+
+If the 30-minute deadline is reached, the row becomes `needs_attention` and is not published late. Expired retry rows remain claimable only so the worker can perform this terminal state transition; it does not call Threads after the deadline.
 
 If the network fails after Threads accepted a publish but before the returned ID can be persisted, do not blindly reset the row to `approved`. Reconcile the Threads account and queue state first; external publication cannot be made perfectly transactional with Supabase.
+
+Partial failures after the main post ID is already known remain conservative/manual so the main post is not duplicated while attempting to recover a reply chain.
 
 ## 11. Updating the Operator
 
@@ -195,7 +218,9 @@ git pull --ff-only
 bash scripts/bootstrap.sh
 ```
 
-Apply any new forward database migrations, including `006_security_hardening.sql` on deployments that predate it. Bootstrap is intended to be safe to run again. Re-run `doctor` for each enabled account after upgrades.
+Apply any new forward database migrations, including `006_security_hardening.sql` and `007_publish_recovery.sql` on deployments that predate them. Bootstrap is intended to be safe to run again. Re-run `doctor` for each enabled account after upgrades.
+
+When upgrading an older deployment that uses campaign-specific legacy executors, inventory those executors before switching them to the shared publisher. Do not assume pulling this repository automatically changes external Hermes cron jobs or scripts outside the repository.
 
 ## 12. Repository Security
 
@@ -205,14 +230,18 @@ The CI workflow uses read-only repository permission, immutable action SHAs, the
 
 Do not commit production `.env` files, browser profiles, cookies, access tokens, Supabase service-role keys, or LLM provider keys.
 
+Never publish diagnostic/control text to a production Threads account. Real integration publishing tests require a dedicated test account. Unit/regression tests must use mocks or stubs.
+
 ## 13. Failure Rules
 
 - Missing account selector: stop; never guess an account.
 - Missing account env: stop; do not fall back to another account's credentials.
 - Invalid/non-official Threads API base URL: stop before sending the Threads token.
 - Login/CAPTCHA/2FA challenge: stop Activity collection; do not bypass it.
-- OAuth/permission error: stop and repair credentials; do not retry as a transient publish failure.
+- OAuth/permission/restriction error: stop automatic publish recovery and move the row to attention; do not retry as transient.
+- Transport, rate-limit, Meta 5xx or unclassified non-permanent publish failure: enter bounded automatic recovery until success or the 30-minute deadline.
+- Recovery deadline reached: do not publish late; move the row to `needs_attention` with diagnostics.
 - Lost queue claim: do not publish.
-- Partial publish: retain known IDs and reconcile; do not blindly requeue.
+- Partial publish: retain known IDs and reconcile; do not blindly requeue the whole row.
 - Supabase unavailable: do not claim persistence or successful posting state.
 - Hermes/model generation failure: do not create or approve a placeholder draft.
