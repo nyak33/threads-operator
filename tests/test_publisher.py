@@ -12,11 +12,11 @@ class FakeStore:
         self.calls = []
 
     def peek_due_post(self, table, campaign_code=None, now=None):
-        self.calls.append(("peek", table, campaign_code))
+        self.calls.append(("peek", table, campaign_code, now))
         return self.row
 
     def claim_due_post(self, table, campaign_code=None, now=None):
-        self.calls.append(("claim", table, campaign_code))
+        self.calls.append(("claim", table, campaign_code, now))
         return self.row
 
     def mark_post_main_published(self, table, row_id, post_id):
@@ -109,10 +109,17 @@ def test_dry_run_peeks_without_claiming_or_publishing():
     store = FakeStore(row())
     api = FakeAPI(["post-1"])
 
-    result = publish_next(api, store, "queue", campaign_code="RANDOM", dry_run=True)
+    result = publish_next(
+        api,
+        store,
+        "queue",
+        campaign_code="RANDOM",
+        dry_run=True,
+        now=NOW,
+    )
 
     assert result == {"status": "dry-run", "queue_id": 7}
-    assert store.calls == [("peek", "queue", "RANDOM")]
+    assert store.calls[0][0:3] == ("peek", "queue", "RANDOM")
     assert api.calls == []
 
 
@@ -120,7 +127,7 @@ def test_no_due_row_returns_idle():
     store = FakeStore(None)
     api = FakeAPI()
 
-    assert publish_next(api, store, "queue") == {"status": "idle"}
+    assert publish_next(api, store, "queue", now=NOW) == {"status": "idle"}
     assert api.calls == []
 
 
@@ -128,7 +135,7 @@ def test_main_only_publish_claims_before_api_and_marks_posted():
     store = FakeStore(row())
     api = FakeAPI(["post-1"])
 
-    result = publish_next(api, store, "queue")
+    result = publish_next(api, store, "queue", now=NOW)
 
     assert result == {
         "status": "posted",
@@ -146,7 +153,7 @@ def test_reply_chain_uses_previous_post_as_parent_and_persists_progress():
     store = FakeStore(row(["reply one", "reply two"]))
     api = FakeAPI(["post-1", "reply-1", "reply-2"])
 
-    result = publish_next(api, store, "queue")
+    result = publish_next(api, store, "queue", now=NOW)
 
     assert api.calls == [
         ("main post", None),
@@ -165,7 +172,7 @@ def test_failure_after_main_publish_retains_main_id_and_marks_failed():
     store = FakeStore(row(["reply one"]))
     api = FakeAPI(["post-1"], fail_at=2)
 
-    result = publish_next(api, store, "queue")
+    result = publish_next(api, store, "queue", now=NOW)
 
     assert result["status"] == "failed"
     assert result["queue_id"] == 7
@@ -181,7 +188,7 @@ def test_failure_after_one_reply_keeps_successful_reply_id_persisted():
     store = FakeStore(row(["reply one", "reply two"]))
     api = FakeAPI(["post-1", "reply-1"], fail_at=3)
 
-    result = publish_next(api, store, "queue")
+    result = publish_next(api, store, "queue", now=NOW)
 
     assert result["status"] == "failed"
     assert result["main_post_id"] == "post-1"
@@ -236,4 +243,21 @@ def test_retryable_failure_after_30_minute_deadline_requires_attention():
 
     assert result["status"] == "needs_attention"
     assert not [call for call in store.calls if call[0] == "retrying"]
+    assert len([call for call in store.calls if call[0] == "needs-attention"]) == 1
+
+
+def test_overdue_row_is_not_published_after_30_minute_window():
+    overdue = row()
+    store = FakeStore(overdue)
+    api = FakeAPI(["should-not-publish"])
+
+    result = publish_next(
+        api,
+        store,
+        "queue",
+        now=datetime(2026, 9, 17, 6, 31, tzinfo=timezone.utc),
+    )
+
+    assert result["status"] == "needs_attention"
+    assert api.calls == []
     assert len([call for call in store.calls if call[0] == "needs-attention"]) == 1
