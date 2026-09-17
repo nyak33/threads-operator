@@ -20,6 +20,45 @@ ACCOUNT_METRICS = (
     "followers_count",
 )
 
+_PUBLISH_NOT_READY_MARKERS = (
+    "still processing",
+    "not ready",
+    "media processing",
+    "processing media",
+)
+_PUBLISH_PERMANENT_MARKERS = (
+    "invalid oauth",
+    "access token",
+    "permission",
+    "not authorized",
+    "unsupported request",
+    "invalid parameter",
+    "restricted",
+    "blocked",
+    "banned",
+)
+
+
+class ThreadsPublishError(httpx.HTTPStatusError):
+    """Structured Threads publish failure safe for queue-level recovery logic."""
+
+    def __init__(
+        self,
+        *,
+        response: httpx.Response,
+        retryable: bool,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        message = str(diagnostics.get("error_message") or "Threads publish failed")
+        super().__init__(
+            f"Threads publish failed ({response.status_code}): {message}",
+            request=response.request,
+            response=response,
+        )
+        self.retryable = retryable
+        self.status_code = response.status_code
+        self.diagnostics = diagnostics
+
 
 def has_usable_metrics(row: dict[str, Any]) -> bool:
     """Return True when at least one core post metric is present, including zero."""
@@ -59,6 +98,22 @@ class ThreadsAPI:
         self.user_id = user_id
         self.base_url = _validate_base_url(base_url)
         self.client = client or httpx.Client(timeout=30)
+        # Publishing is an explicit capability. Read-only/diagnostic callers must
+        # opt in before crossing the public threads_publish boundary.
+        self._publishing_allowed = False
+
+    def enable_publishing(self) -> None:
+        """Explicitly enable public publishing for an approved production flow."""
+        self._publishing_allowed = True
+
+    def disable_publishing(self) -> None:
+        self._publishing_allowed = False
+
+    def _require_publishing_allowed(self) -> None:
+        if not self._publishing_allowed:
+            raise PermissionError(
+                "Threads publishing is disabled; explicit production enablement is required"
+            )
 
     def _params(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"access_token": self.access_token}
@@ -129,6 +184,7 @@ class ThreadsAPI:
 
     def publish_container(self, creation_id: str) -> str:
         """Publish one existing media container and return the Threads post id."""
+        self._require_publishing_allowed()
         if not creation_id:
             raise ValueError("Threads creation id is required")
         response = self.client.post(
@@ -138,7 +194,8 @@ class ThreadsAPI:
                 "creation_id": str(creation_id),
             },
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise _publish_error(response)
         post_id = response.json().get("id")
         if not post_id:
             raise ValueError("Threads publish response did not include id")
@@ -152,17 +209,20 @@ class ThreadsAPI:
         max_attempts: int = 4,
         retry_delay_seconds: float = 2.0,
     ) -> str:
-        """Create and publish text, retrying only transient publish readiness failures."""
+        """Create and publish text, retrying only container-readiness failures.
+
+        Queue-level recovery owns broader transient failures so a later attempt
+        creates a fresh container instead of blindly reusing a failed one.
+        """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
         for attempt in range(max_attempts):
             try:
                 return self.publish_container(creation_id)
-            except httpx.HTTPStatusError as exc:
-                if attempt >= max_attempts - 1 or not _is_transient_publish_error(
-                    exc.response
-                ):
+            except ThreadsPublishError as exc:
+                classification = str(exc.diagnostics.get("classification") or "")
+                if attempt >= max_attempts - 1 or classification != "container_not_ready":
                     raise
                 if retry_delay_seconds > 0:
                     time.sleep(retry_delay_seconds * (2**attempt))
@@ -202,30 +262,77 @@ class ThreadsAPI:
         return result
 
 
-def _is_transient_publish_error(response: httpx.Response) -> bool:
-    if response.status_code == 429 or response.status_code >= 500:
-        return True
-    if response.status_code != 400:
-        return False
+def _publish_error(response: httpx.Response) -> ThreadsPublishError:
+    payload: dict[str, Any] = {}
     try:
-        payload = response.json()
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            payload = parsed
     except ValueError:
-        return False
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-    if "oauth" in str(error.get("type", "")).lower():
-        return False
-    message = str(error.get("message", "")).lower()
-    return any(
-        marker in message
-        for marker in (
-            "still processing",
-            "not ready",
-            "media processing",
-            "processing media",
-        )
+        pass
+
+    raw_error = payload.get("error")
+    error = raw_error if isinstance(raw_error, dict) else {}
+    error_message = str(error.get("message") or "")
+    error_type = str(error.get("type") or "")
+    error_code = error.get("code")
+    error_subcode = error.get("error_subcode")
+    fbtrace_id = error.get("fbtrace_id")
+
+    retryable, classification = _classify_publish_error(
+        response.status_code,
+        error_message=error_message,
+        error_type=error_type,
+        error_code=error_code,
     )
+    diagnostics = {
+        "http_status": response.status_code,
+        "error_message": error_message or None,
+        "error_type": error_type or None,
+        "error_code": error_code,
+        "error_subcode": error_subcode,
+        "fbtrace_id": fbtrace_id,
+        "classification": classification,
+    }
+    return ThreadsPublishError(
+        response=response,
+        retryable=retryable,
+        diagnostics=diagnostics,
+    )
+
+
+def _classify_publish_error(
+    status_code: int,
+    *,
+    error_message: str,
+    error_type: str,
+    error_code: Any,
+) -> tuple[bool, str]:
+    message = error_message.lower()
+    error_type_lower = error_type.lower()
+
+    if "oauth" in error_type_lower or error_code == 190:
+        return False, "permanent"
+    if any(marker in message for marker in _PUBLISH_PERMANENT_MARKERS):
+        return False, "permanent"
+    if status_code == 429 or status_code >= 500:
+        return True, "temporary"
+    if status_code == 400:
+        if any(marker in message for marker in _PUBLISH_NOT_READY_MARKERS):
+            return True, "container_not_ready"
+        # A generic Meta 400 can be intermittent. Preserve it and let the queue
+        # retry with a fresh container inside the bounded recovery window.
+        return True, "unknown_400"
+    return False, "permanent"
+
+
+def _is_transient_publish_error(response: httpx.Response) -> bool:
+    """Backward-compatible helper used by callers/tests outside this module."""
+    try:
+        error = _publish_error(response)
+    except Exception:
+        return False
+    return bool(error.retryable)
 
 
 def _is_metric_availability_error(response: httpx.Response) -> bool:
