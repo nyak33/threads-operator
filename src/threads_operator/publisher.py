@@ -70,6 +70,16 @@ def _error_details(exc: Exception) -> tuple[str, dict[str, Any], bool | None]:
     return error, dict(diagnostics), retryable
 
 
+def _recovery_deadline(row: dict[str, Any]) -> datetime | None:
+    existing = _parse_time(row.get("retry_deadline_at"))
+    if existing is not None:
+        return existing
+    scheduled = _parse_time(row.get("scheduled_at"))
+    if scheduled is None:
+        return None
+    return scheduled + RECOVERY_WINDOW
+
+
 def publish_next(
     api: ThreadsAPI,
     store: SupabaseStore,
@@ -86,19 +96,46 @@ def publish_next(
     from scratch. Partial publishes remain terminal/manual to avoid duplicating a
     main post whose ID has already been persisted.
     """
+    current = (now or _utc_now()).astimezone(timezone.utc)
+    current_iso = _iso(current)
+
     if dry_run:
-        candidate = store.peek_due_post(table, campaign_code=campaign_code)
+        candidate = store.peek_due_post(
+            table,
+            campaign_code=campaign_code,
+            now=current_iso,
+        )
         if not candidate:
             return {"status": "idle"}
         return {"status": "dry-run", "queue_id": candidate.get("id")}
 
-    row = store.claim_due_post(table, campaign_code=campaign_code)
+    row = store.claim_due_post(
+        table,
+        campaign_code=campaign_code,
+        now=current_iso,
+    )
     if not row:
         return {"status": "idle"}
 
     row_id = row.get("id")
     if row_id is None:
         raise ValueError("Claimed queue row is missing id")
+
+    deadline = _recovery_deadline(row)
+    if deadline is not None and current >= deadline:
+        error = "Automatic publish recovery window expired before publish attempt"
+        diagnostics = {
+            "classification": "recovery_window_expired",
+            "scheduled_at": row.get("scheduled_at"),
+            "retry_deadline_at": _iso(deadline),
+        }
+        store.mark_post_needs_attention(table, row_id, error, diagnostics)
+        return {
+            "status": "needs_attention",
+            "queue_id": row_id,
+            "error": error,
+            "diagnostics": diagnostics,
+        }
 
     main_post_id: str | None = None
     reply_ids: list[str] = []
@@ -149,16 +186,13 @@ def publish_next(
             return result
 
         if retryable is True:
-            current = (now or _utc_now()).astimezone(timezone.utc)
-            scheduled = _parse_time(row.get("scheduled_at")) or current
-            existing_deadline = _parse_time(row.get("retry_deadline_at"))
-            deadline = existing_deadline or (scheduled + RECOVERY_WINDOW)
+            effective_deadline = deadline or (current + RECOVERY_WINDOW)
             attempt_count = int(row.get("attempt_count") or 0) + 1
 
-            if current < deadline:
+            if current < effective_deadline:
                 next_retry = min(
                     current + timedelta(seconds=_retry_delay(attempt_count)),
-                    deadline,
+                    effective_deadline,
                 )
                 try:
                     store.mark_post_retrying(
@@ -167,7 +201,7 @@ def publish_next(
                         error,
                         diagnostics,
                         _iso(next_retry),
-                        _iso(deadline),
+                        _iso(effective_deadline),
                         attempt_count,
                     )
                 except Exception as persistence_exc:
@@ -182,7 +216,7 @@ def publish_next(
                     "error": error,
                     "attempt_count": attempt_count,
                     "next_retry_at": _iso(next_retry),
-                    "retry_deadline_at": _iso(deadline),
+                    "retry_deadline_at": _iso(effective_deadline),
                     "diagnostics": diagnostics,
                 }
 
