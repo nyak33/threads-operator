@@ -83,6 +83,42 @@ def test_publish_text_retries_transient_processing_error():
     assert publish_attempts == 2
 
 
+def test_publish_text_recreates_container_once_after_persistent_400():
+    created = 0
+    publish_attempts = 0
+
+    def handler(request):
+        nonlocal created, publish_attempts
+        if request.url.path.endswith("/threads"):
+            created += 1
+            return httpx.Response(200, json={"id": f"creation-{created}"})
+        publish_attempts += 1
+        if publish_attempts == 1:
+            return httpx.Response(400, json={"error": {"message": "Bad request"}})
+        return httpx.Response(200, json={"id": "post-2"})
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    assert api.publish_text("hello", max_attempts=1, retry_delay_seconds=0) == "post-2"
+    assert created == 2
+    assert publish_attempts == 2
+
+
+def test_publish_text_no_container_retry_when_container_retries_zero():
+    publish_attempts = 0
+
+    def handler(request):
+        nonlocal publish_attempts
+        if request.url.path.endswith("/threads"):
+            return httpx.Response(200, json={"id": "creation-1"})
+        publish_attempts += 1
+        return httpx.Response(400, json={"error": {"message": "Bad request"}})
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        api.publish_text("hello", max_attempts=1, retry_delay_seconds=0, container_retries=0)
+    assert publish_attempts == 1
+
+
 def test_publish_text_does_not_retry_oauth_failure():
     publish_attempts = 0
 

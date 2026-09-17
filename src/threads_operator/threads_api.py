@@ -151,22 +151,36 @@ class ThreadsAPI:
         *,
         max_attempts: int = 4,
         retry_delay_seconds: float = 2.0,
+        container_retries: int = 1,
     ) -> str:
-        """Create and publish text, retrying only transient publish readiness failures."""
+        """Create and publish text, retrying only transient publish failures.
+
+        If the publish still fails after same-container retries, recreate the
+        container once with identical text and try again — Meta transiently
+        rejects some containers on threads_publish while accepting a fresh one.
+        """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
-        creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
-        for attempt in range(max_attempts):
-            try:
-                return self.publish_container(creation_id)
-            except httpx.HTTPStatusError as exc:
-                if attempt >= max_attempts - 1 or not _is_transient_publish_error(
-                    exc.response
-                ):
-                    raise
-                if retry_delay_seconds > 0:
-                    time.sleep(retry_delay_seconds * (2**attempt))
-        raise RuntimeError("unreachable publish retry state")
+        if container_retries < 0:
+            raise ValueError("container_retries must be at least 0")
+        last_exc: httpx.HTTPStatusError | None = None
+        for _ in range(container_retries + 1):
+            creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
+            for attempt in range(max_attempts):
+                try:
+                    return self.publish_container(creation_id)
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    if _is_non_retryable_publish_error(exc.response):
+                        raise
+                    if attempt >= max_attempts - 1 or not _is_transient_publish_error(
+                        exc.response
+                    ):
+                        break
+                    if retry_delay_seconds > 0:
+                        time.sleep(retry_delay_seconds * (2**attempt))
+        assert last_exc is not None
+        raise last_exc
 
     def _get_insights(
         self,
@@ -200,6 +214,18 @@ class ThreadsAPI:
             single.raise_for_status()
             _merge_metric_payload(result, single.json())
         return result
+
+
+def _is_non_retryable_publish_error(response: httpx.Response) -> bool:
+    """OAuth/auth and permission errors must never trigger a container retry."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    return "oauth" in str(error.get("type", "")).lower()
 
 
 def _is_transient_publish_error(response: httpx.Response) -> bool:
