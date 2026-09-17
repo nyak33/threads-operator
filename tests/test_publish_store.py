@@ -35,7 +35,7 @@ def test_peek_due_post_is_scoped_to_account_and_optional_campaign():
             )
         assert params["status"] == "eq.retrying"
         assert params["next_retry_at"] == f"lte.{NOW}"
-        assert params["retry_deadline_at"] == f"gt.{NOW}"
+        assert "retry_deadline_at" not in params
         return httpx.Response(200, json=[])
 
     store = SupabaseStore(
