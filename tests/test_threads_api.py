@@ -185,3 +185,83 @@ def test_oauth_400_is_not_silently_treated_as_missing_metrics():
     api = ThreadsAPI("token", "user-123", client=make_client(handler))
     with pytest.raises(httpx.HTTPStatusError):
         api.get_post_insights("post-1")
+
+
+def test_unknown_publish_400_is_preserved_as_retryable_diagnostic_error():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("/threads"):
+            return httpx.Response(200, json={"id": "container-1"})
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Unexpected publish failure",
+                    "type": "GraphMethodException",
+                    "code": 100,
+                    "error_subcode": 2207026,
+                    "fbtrace_id": "trace-abc",
+                }
+            },
+        )
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    api.__dict__["_publishing_allowed"] = True
+
+    with pytest.raises(Exception) as exc_info:
+        api.publish_text("hello", max_attempts=1)
+
+    exc = exc_info.value
+    assert getattr(exc, "retryable", None) is True
+    assert getattr(exc, "status_code", None) == 400
+    diagnostics = getattr(exc, "diagnostics", {})
+    assert diagnostics["error_code"] == 100
+    assert diagnostics["error_subcode"] == 2207026
+    assert diagnostics["fbtrace_id"] == "trace-abc"
+    assert diagnostics["classification"] == "unknown_400"
+
+
+def test_oauth_publish_400_is_classified_permanent():
+    def handler(request):
+        if request.url.path.endswith("/threads"):
+            return httpx.Response(200, json={"id": "container-1"})
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Invalid OAuth access token.",
+                    "type": "OAuthException",
+                    "code": 190,
+                    "fbtrace_id": "trace-oauth",
+                }
+            },
+        )
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    api.__dict__["_publishing_allowed"] = True
+
+    with pytest.raises(Exception) as exc_info:
+        api.publish_text("hello", max_attempts=1)
+
+    exc = exc_info.value
+    assert getattr(exc, "retryable", None) is False
+    assert getattr(exc, "diagnostics", {})["classification"] == "permanent"
+
+
+def test_publish_is_blocked_without_explicit_production_enable():
+    called = False
+
+    def handler(request):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"id": "post-1"})
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    api.__dict__["_publishing_allowed"] = False
+
+    with pytest.raises(PermissionError, match="publishing is disabled"):
+        api.publish_container("container-1")
+
+    assert called is False
