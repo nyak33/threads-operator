@@ -50,6 +50,7 @@ def test_publish_container_posts_creation_id():
         return httpx.Response(200, json={"id": "post-1"})
 
     api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    api.enable_publishing()
     assert api.publish_container("creation-1") == "post-1"
 
 
@@ -79,6 +80,7 @@ def test_publish_text_retries_transient_processing_error():
         return httpx.Response(200, json={"id": "post-1"})
 
     api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    api.enable_publishing()
     assert api.publish_text("hello", max_attempts=2, retry_delay_seconds=0) == "post-1"
     assert publish_attempts == 2
 
@@ -103,6 +105,7 @@ def test_publish_text_does_not_retry_oauth_failure():
         )
 
     api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    api.enable_publishing()
     with pytest.raises(httpx.HTTPStatusError):
         api.publish_text("hello", max_attempts=4, retry_delay_seconds=0)
     assert publish_attempts == 1
