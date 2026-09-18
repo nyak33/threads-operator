@@ -143,6 +143,38 @@ On Skip:
 
 The row becomes `rejected` and is not shown again as pending.
 
+## Live callback dispatcher
+
+The Telebot buttons are wired end-to-end. The Hermes gateway Telegram adapter
+owns the single `getUpdates` poller for the bot token, so the dispatcher lives
+inside the gateway as a prefix branch on `engagement:` — the bridge module in
+this repo (`src/threads_operator/engagement_telegram.py`) runs the CLI
+subprocess and formats cards; the adapter only forwards taps and edit-session
+text.
+
+- **Approve** → `engagement approve --account syaqir --id <ID> --approval-ref tg:<chat>:<msg>`;
+  then, only if `THREADS_ENGAGEMENT_ENABLED=true`, `engagement execute --id <ID>`.
+  The card is edited in place with the result (posted + reply ID, disabled, or failure).
+- **Edit** → creates a restart-safe pending-edit session and asks for the
+  replacement reply; the sender's next message runs `engagement edit` (keeps
+  `pending_approval`) and refreshes the card. `cancel` aborts without touching the row.
+- **Skip** → `engagement reject` and the card is marked rejected.
+
+Security/state rules enforced by the dispatcher + CLI:
+
+- The dispatcher never writes to Supabase directly; every transition goes through the CLI.
+- The CLI validates the row belongs to `--account` and is `pending_approval`, so stale or
+  duplicate taps are answered "Already resolved — no longer pending." (idempotent).
+- Only the same Telegram chat+user that pressed Edit can supply the replacement text;
+  sessions expire after 30 minutes (`THREADS_ENGAGEMENT_EDIT_SESSIONS_PATH` overrides the store path).
+- Callback payloads stay short: `engagement:<action>:<id>` (no credentials).
+- Execution requires explicit prior approval and `THREADS_ENGAGEMENT_ENABLED=true`.
+- No LLM provider/model is hardcoded; Threads Operator stays model-agnostic.
+
+Reusing for another account: point the bridge at another account key
+(`THREADS_ENGAGEMENT_ACCOUNT` env on the gateway) and use that account's persona;
+no other change is needed.
+
 ## Pending list
 
 Hermes can recover pending approval cards after restart:
