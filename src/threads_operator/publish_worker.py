@@ -1,29 +1,37 @@
 """Account-scoped publish worker with automatic transient retry.
 
 Wraps :func:`threads_operator.publisher.publish_next` with the recovery loop
-the production cron flow needs: when a publish fails with a *transient* error
-(network, 429, 5xx, or a non-OAuth 400 — the same classification the API
-adapter uses for its own retries), the queue row is reset to ``approved`` so
-the next scheduled tick picks it up automatically. Genuinely non-recoverable
-errors (OAuth/auth, permission, permanent rejection) stay ``failed`` for
+the production cron flow needs. Meta intermittently answers ``threads_publish``
+with a bare 400 during bad windows that can outlast a single short retry burst,
+so the worker persists *within the run*: each transient failure is requeued to
+``approved`` and the same run re-claims and retries with a fresh container and
+backoff, until either the publish succeeds, a non-transient error stops it, or
+the per-run deadline is hit (leaving the row ``approved`` for the next tick).
+Genuinely non-recoverable errors (OAuth/auth, permission) stay ``failed`` for
 manual review.
 
 This is the deterministic, no-LLM worker intended to run on a short cron
 interval (for example every 5 minutes). Selection is account-scoped and
-oldest-first; an optional campaign code narrows it further.
+oldest-first; an optional campaign code narrows it further. Only
+``status=approved`` rows with ``scheduled_at <= now`` are ever published, so a
+future-scheduled row is never posted early regardless of retries.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .publisher import publish_next
 from .supabase_store import SupabaseStore
-from .threads_api import (
-    ThreadsAPI,
-    _is_non_retryable_publish_error,
-    _is_transient_publish_error,
-)
+from .threads_api import ThreadsAPI
+
+# Defaults tuned for a */5 cron tick: keep fighting a transient window within
+# the same run, but always yield well before the next tick so runs never pile
+# up. A hard wall-clock cap also bounds pathological cases.
+DEFAULT_ATTEMPT_DEADLINE_SECONDS = 120.0
+DEFAULT_MAX_ATTEMPTS = 8
+ATTEMPT_BACKOFF_SECONDS = (2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 30.0, 30.0)
 
 
 def is_transient_publish_result(result: dict[str, Any]) -> bool:
@@ -84,6 +92,12 @@ def requeue_failed_row(
     return bool(rows)
 
 
+def _backoff_seconds(attempt_index: int) -> float:
+    if attempt_index < len(ATTEMPT_BACKOFF_SECONDS):
+        return ATTEMPT_BACKOFF_SECONDS[attempt_index]
+    return ATTEMPT_BACKOFF_SECONDS[-1]
+
+
 def publish_next_with_recovery(
     api: ThreadsAPI,
     store: SupabaseStore,
@@ -91,27 +105,56 @@ def publish_next_with_recovery(
     campaign_code: str | None = None,
     *,
     dry_run: bool = False,
+    attempt_deadline_seconds: float = DEFAULT_ATTEMPT_DEADLINE_SECONDS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    sleep: Any = time.sleep,
+    clock: Any = time.monotonic,
 ) -> dict[str, Any]:
-    """Publish the oldest due approved row, auto-requeuing transient failures.
+    """Publish the oldest due approved row, persisting through transient failure.
 
-    Returns the publish_next result, augmented with ``requeued=True`` when a
-    transient failure was reset to ``approved`` for the next scheduled run.
+    Each transient failure requeues the row to ``approved`` and, while the
+    per-run deadline and attempt budget allow, the same run re-claims and
+    retries with a fresh container after a growing backoff. The loop only ever
+    re-selects ``approved`` rows with ``scheduled_at <= now`` (oldest first),
+    so scheduled future posts are never posted early.
+
+    Returns the final publish_next result, augmented with ``requeued=True``
+    when the last failure was reset to ``approved`` for the next scheduled run,
+    and ``attempts`` recording how many publish passes this run made.
     """
-    result = publish_next(
-        api, store, table, campaign_code=campaign_code, dry_run=dry_run
-    )
-    if dry_run or result.get("status") != "failed":
-        return result
+    if dry_run:
+        return publish_next(api, store, table, campaign_code=campaign_code, dry_run=True)
 
-    row_id = result.get("queue_id")
-    error = result.get("error", "unknown error")
-    if row_id is None:
-        return result
-    if is_transient_publish_result(result):
-        try:
-            if requeue_failed_row(store, table, row_id, error):
-                result["requeued"] = True
-        except Exception:
-            # A failed requeue must not mask the original publish failure.
-            result["requeued"] = False
-    return result
+    deadline = clock() + attempt_deadline_seconds
+    attempts = 0
+    while True:
+        result = publish_next(api, store, table, campaign_code=campaign_code)
+        if result.get("status") != "failed":
+            if attempts:
+                result["attempts"] = attempts + 1
+            return result
+
+        row_id = result.get("queue_id")
+        error = result.get("error", "unknown error")
+        if row_id is None:
+            result["attempts"] = attempts + 1
+            return result
+
+        if is_transient_publish_result(result):
+            try:
+                if requeue_failed_row(store, table, row_id, error):
+                    result["requeued"] = True
+            except Exception:
+                # A failed requeue must not mask the original publish failure.
+                result["requeued"] = False
+
+        attempts += 1
+        result["attempts"] = attempts
+        if not result.get("requeued") or attempts >= max_attempts:
+            return result
+        wait = _backoff_seconds(attempts - 1)
+        if clock() + wait >= deadline:
+            # Not enough budget left to retry within this run — leave the row
+            # approved for the next scheduled tick.
+            return result
+        sleep(wait)

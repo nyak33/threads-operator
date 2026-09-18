@@ -163,7 +163,15 @@ class ThreadsAPI:
                 "creation_id": str(creation_id),
             },
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Surface Meta's error body so callers can diagnose rejects that
+            # raise_for_status alone would swallow behind a bare status line.
+            raise httpx.HTTPStatusError(
+                f"Meta publish rejected ({response.status_code}): "
+                f"{_format_error_payload(response)}",
+                request=response.request,
+                response=response,
+            )
         post_id = response.json().get("id")
         if not post_id:
             raise ValueError("Threads publish response did not include id")
@@ -183,6 +191,10 @@ class ThreadsAPI:
         If the publish still fails after same-container retries, recreate the
         container once with identical text and try again — Meta transiently
         rejects some containers on threads_publish while accepting a fresh one.
+        A non-OAuth 400 that Meta does not flag as a processing state is also
+        treated as transient here: production runs show Meta intermittently
+        answers threads_publish with a bare 400 during bad windows, then accepts
+        the identical request on retry. OAuth/permission errors still abort.
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -253,6 +265,25 @@ def _is_non_retryable_publish_error(response: httpx.Response) -> bool:
     return "oauth" in str(error.get("type", "")).lower()
 
 
+def _format_error_payload(response: httpx.Response) -> str:
+    """Compact, token-free rendering of Meta's error body for logs/last_error."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return f"non-JSON body: {response.text[:300]}"
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        parts = [
+            f"message={error.get('message')!r}",
+            f"type={error.get('type')!r}",
+            f"code={error.get('code')!r}",
+        ]
+        if error.get("error_subcode") is not None:
+            parts.append(f"subcode={error.get('error_subcode')!r}")
+        return "Meta error: " + ", ".join(parts)
+    return f"body={str(payload)[:300]}"
+
+
 def _is_transient_publish_error(response: httpx.Response) -> bool:
     if response.status_code == 429 or response.status_code >= 500:
         return True
@@ -265,10 +296,17 @@ def _is_transient_publish_error(response: httpx.Response) -> bool:
     error = payload.get("error")
     if not isinstance(error, dict):
         return False
-    if "oauth" in str(error.get("type", "")).lower():
+    error_type = str(error.get("type", "")).lower()
+    if "oauth" in error_type:
         return False
     message = str(error.get("message", "")).lower()
-    return any(
+    # A rate/limit rejection is not helped by immediate in-call retries — the
+    # worker's scheduled requeue to the next tick handles the backoff instead.
+    if "rate" in error_type or "limit" in message:
+        return False
+    # Explicit processing-state markers Meta returns while a container is not
+    # yet publishable; retrying the same container is the correct response.
+    if any(
         marker in message
         for marker in (
             "still processing",
@@ -276,7 +314,13 @@ def _is_transient_publish_error(response: httpx.Response) -> bool:
             "media processing",
             "processing media",
         )
-    )
+    ):
+        return True
+    # Any other non-OAuth 400: Meta intermittently rejects threads_publish with
+    # a bare 400 during bad windows and then accepts the identical request.
+    # Treat as transient (fresh-container retry) — production evidence shows the
+    # same text publishes cleanly once the window passes.
+    return True
 
 
 def _is_metric_availability_error(response: httpx.Response) -> bool:
