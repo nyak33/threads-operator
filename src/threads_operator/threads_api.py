@@ -210,9 +210,13 @@ class ThreadsAPI:
                     last_exc = exc
                     if _is_non_retryable_publish_error(exc.response):
                         raise
-                    if attempt >= max_attempts - 1 or not _is_transient_publish_error(
-                        exc.response
-                    ):
+                    retry_in_call = _is_transient_publish_error(exc.response)
+                    if not retry_in_call:
+                        # Rate limits and permanent/non-transient HTTP errors
+                        # must yield to the worker instead of creating another
+                        # container in this same API call.
+                        raise
+                    if attempt >= max_attempts - 1:
                         break
                     if retry_delay_seconds > 0:
                         time.sleep(retry_delay_seconds * (2**attempt))
@@ -262,7 +266,15 @@ def _is_non_retryable_publish_error(response: httpx.Response) -> bool:
     error = payload.get("error")
     if not isinstance(error, dict):
         return False
-    return "oauth" in str(error.get("type", "")).lower()
+    error_type = str(error.get("type", "")).lower()
+    message = str(error.get("message", "")).lower()
+    code = error.get("code")
+    return (
+        "oauth" in error_type
+        or "permission" in error_type
+        or "permission" in message
+        or code in {10, 190, 200}
+    )
 
 
 def _format_error_payload(response: httpx.Response) -> str:
@@ -285,24 +297,37 @@ def _format_error_payload(response: httpx.Response) -> str:
 
 
 def _is_transient_publish_error(response: httpx.Response) -> bool:
-    if response.status_code == 429 or response.status_code >= 500:
+    # This function answers whether retrying *inside the same API call* is
+    # appropriate. Rate limits deliberately return False so the outer worker
+    # can requeue and yield to the next cron tick.
+    if response.status_code == 429:
+        return False
+    if response.status_code >= 500:
         return True
     if response.status_code != 400:
         return False
     try:
         payload = response.json()
     except ValueError:
-        return False
+        # A body-less/bare 400 has been observed transiently in production.
+        return True
     error = payload.get("error")
     if not isinstance(error, dict):
-        return False
+        return True
     error_type = str(error.get("type", "")).lower()
     if "oauth" in error_type:
         return False
     message = str(error.get("message", "")).lower()
+    code = error.get("code")
     # A rate/limit rejection is not helped by immediate in-call retries — the
     # worker's scheduled requeue to the next tick handles the backoff instead.
-    if "rate" in error_type or "limit" in message:
+    if (
+        "rate" in error_type
+        or "limit" in message
+        or "too many requests" in message
+        or "throttl" in message
+        or code in {4, 17, 32, 613}
+    ):
         return False
     # Explicit processing-state markers Meta returns while a container is not
     # yet publishable; retrying the same container is the correct response.
