@@ -67,7 +67,8 @@ def test_propose_reply_is_pending_approval_and_account_scoped():
         reason="high relevance",
     )
 
-    assert result["status"] == "pending_approval"
+    assert result["result"] == "inserted"
+    assert result["action"]["status"] == "pending_approval"
     post_call = next(call for call in client.calls if call[0] == "post")
     payload = post_call[3]
     assert payload["account_key"] == "syaqir"
@@ -89,9 +90,12 @@ def test_propose_reply_dedupes_existing_action():
     )
 
     assert result == {
-        "status": "pending_approval",
-        "id": 9,
-        "proposed_text": "old",
+        "result": "existing",
+        "action": {
+            "id": 9,
+            "status": "pending_approval",
+            "proposed_text": "old",
+        },
     }
     assert not any(call[0] == "post" for call in client.calls)
 
