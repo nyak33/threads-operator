@@ -18,6 +18,7 @@ from .account_config import (
 )
 from .activity_collector import collect_activity_follows
 from .collector import collect_once
+from .publish_worker import publish_next_with_recovery
 from .publisher import publish_next
 from .safe_errors import redact_error
 from .supabase_store import SupabaseStore
@@ -63,6 +64,18 @@ def _parser() -> argparse.ArgumentParser:
     publish = sub.add_parser("publish", help="Publish one approved due queue item")
     publish.add_argument("--account")
     publish.add_argument("--dry-run", action="store_true")
+
+    worker = sub.add_parser(
+        "publish-worker",
+        help=(
+            "Cron-friendly publish worker: publishes the oldest due approved row "
+            "and automatically requeues transient failures to approved for the "
+            "next scheduled tick. Non-recoverable errors stay failed."
+        ),
+    )
+    worker.add_argument("--account")
+    worker.add_argument("--campaign-code")
+    worker.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -248,6 +261,41 @@ def _run_publish(
     return (1 if result.get("status") == "failed" else 0), result
 
 
+def _run_publish_worker(
+    config: AccountConfig,
+    *,
+    campaign_code: str | None,
+    dry_run: bool,
+) -> tuple[int, dict[str, Any]]:
+    enabled = config.get_bool("THREADS_POSTING_ENABLED")
+    mode = config.get("THREADS_EXECUTION_MODE", "approval_required") or "approval_required"
+    if not dry_run and not (enabled and mode == "auto_post"):
+        return 3, {
+            "status": "disabled",
+            "account": config.name,
+            "error": (
+                "Live posting is disabled; require THREADS_POSTING_ENABLED=true "
+                "and THREADS_EXECUTION_MODE=auto_post"
+            ),
+        }
+    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+    campaign = campaign_code or config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
+    result = publish_next_with_recovery(
+        _api(config),
+        _store(config),
+        table,
+        campaign_code=campaign,
+        dry_run=dry_run,
+    )
+    result = {"account": config.name, **result}
+    # A transient failure that was requeued is recoverable — the next tick will
+    # retry it — so do not signal a hard failure to the caller. A requeue that
+    # could not be persisted is a hard failure (the row stays failed).
+    failed = result.get("status") == "failed"
+    recovered = bool(result.get("requeued"))
+    return (1 if failed and not recovered else 0), result
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -282,6 +330,12 @@ def main(
             )
         elif args.command == "publish":
             code, payload = _run_publish(config, dry_run=args.dry_run)
+        elif args.command == "publish-worker":
+            code, payload = _run_publish_worker(
+                config,
+                campaign_code=args.campaign_code,
+                dry_run=args.dry_run,
+            )
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:

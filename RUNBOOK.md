@@ -184,6 +184,16 @@ New content may enter as `draft`. Draft ingress never promotes it automatically.
 
 The worker conditionally claims `approved -> posting` before calling Threads. The main Threads post ID is persisted before optional replies are attempted. Completed work becomes `posted`; visible partial failures become `failed` and retain known post IDs for reconciliation.
 
+For cron-driven publishing use the `publish-worker` command: identical publishing plus automatic requeue of transient failures (network, 429, 5xx, non-OAuth 400) back to `approved` for the next tick, while OAuth/permission errors stay `failed`. Install and verify it per [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md):
+
+```bash
+hermes cron add --name "Publish Queue Worker (syaqir)" --schedule "*/5 * * * *" \
+  --script /home/admin/threads-operator/scripts/publish_queue_worker_hermes.py \
+  --no-agent
+```
+
+(Edit `ACCOUNT`/`CAMPAIGN_CODE` in the wrapper; one cron job per account.)
+
 If the network fails after Threads accepted a publish but before the returned ID can be persisted, do not blindly reset the row to `approved`. Reconcile the Threads account and queue state first; external publication cannot be made perfectly transactional with Supabase.
 
 ## 11. Updating the Operator
