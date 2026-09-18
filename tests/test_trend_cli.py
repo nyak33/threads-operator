@@ -57,6 +57,71 @@ def test_trend_add_dry_run_prints_sanitized_candidate_and_never_writes(
     assert "token-brand_a" not in out
 
 
+
+def test_trend_add_external_dry_run_marks_explicit_hermes_provenance(
+    tmp_path, capsys, monkeypatch
+):
+    write_account(tmp_path, "brand_a")
+    monkeypatch.setattr(
+        operator_cli,
+        "SupabaseStore",
+        lambda *a, **k: pytest.fail("dry-run must not construct a store"),
+    )
+
+    code = operator_cli.main(
+        [
+            "trend", "add", "--account", "brand_a", "--url", URL,
+            "--external", "--dry-run",
+        ],
+        process_env={"THREADS_OPERATOR_HOME": str(tmp_path)},
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    meta = payload["candidate"]["raw_metadata"]
+    assert meta["candidate_role"] == "external_trend"
+    assert meta["manual"] is False
+    assert meta["discovery_method"] == "hermes_external"
+    assert meta["candidate_roles"] == ["external_trend"]
+    assert meta["discovery_methods"] == ["hermes_external"]
+    assert meta["discovered_by"] == "hermes"
+
+
+def test_trend_add_external_real_run_passes_role_and_provenance(
+    tmp_path, capsys, monkeypatch
+):
+    write_account(tmp_path, "brand_a")
+    seen = {}
+
+    class FakeStore:
+        def __init__(self, *args, account_key=None, **kwargs):
+            seen["account_key"] = account_key
+
+        def insert_trend_candidate(self, url, **kwargs):
+            seen["url"] = url
+            seen["kwargs"] = kwargs
+            return {"status": "inserted", "id": 9, "permalink": url}
+
+    monkeypatch.setattr(operator_cli, "SupabaseStore", FakeStore)
+
+    code = operator_cli.main(
+        [
+            "trend", "add", "--account", "brand_a", "--url", URL,
+            "--external",
+        ],
+        process_env={"THREADS_OPERATOR_HOME": str(tmp_path)},
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "inserted"
+    assert seen["account_key"] == "brand_a"
+    assert seen["kwargs"]["candidate_role"] == "external_trend"
+    meta = seen["kwargs"]["raw_metadata"]
+    assert meta["manual"] is False
+    assert meta["discovery_method"] == "hermes_external"
+    assert meta["candidate_roles"] == ["external_trend"]
+
 def test_trend_add_rejects_non_threads_url_without_writes(
     tmp_path, capsys, monkeypatch
 ):

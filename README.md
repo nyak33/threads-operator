@@ -50,6 +50,10 @@ threads-operator activity-follow --account <key> --dry-run
 threads-operator enqueue-draft --account <key> --text <text>
 threads-operator publish --account <key> --dry-run
 threads-operator publish-worker --account <key> [--campaign-code <code>] [--dry-run]
+threads-operator trend add --account <key> --url <threads-url> [--external] [--dry-run]
+threads-operator trend list --account <key> [--status <status>]
+threads-operator trend show --account <key> --id <candidate-id>
+threads-operator trend enrich --account <key> --id <candidate-id>
 ```
 
 `publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` for the next tick. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
@@ -103,6 +107,29 @@ Each account uses its own persistent Chromium profile. The collector is delibera
 The Activity UI exposes source text/snippets rather than a guaranteed source-post ID. Matching therefore retains explicit high/medium/low/unknown confidence instead of presenting inferred attribution as exact fact.
 
 The detailed design and limitations remain in [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md).
+
+## External Trend Discovery
+
+Trend discovery remains a Hermes responsibility; Threads Operator owns deterministic validation, account scoping, storage and factual enrichment.
+
+Manual URLs use the default ingress:
+
+```bash
+.venv/bin/threads-operator trend add --account syaqir --url "$THREADS_URL"
+```
+
+When Hermes itself discovers an external post, it must use the explicit external flag:
+
+```bash
+.venv/bin/threads-operator trend add \
+  --account syaqir \
+  --url "$THREADS_URL" \
+  --external
+```
+
+That records `candidate_role=external_trend`, `discovery_method=hermes_external` and `discovered_by=hermes` without confusing automated discovery with a manual URL. If the insert returns a new candidate id, Hermes may run `trend enrich --id <id>` to capture observed post facts through the existing read-only browser profile. Existing permalinks remain deduplicated.
+
+See [`docs/hermes-trend-discovery.md`](docs/hermes-trend-discovery.md) for the scheduled discovery flow.
 
 ## Optional Hermes-Generated Drafts
 

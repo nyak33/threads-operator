@@ -91,6 +91,11 @@ def _parser() -> argparse.ArgumentParser:
     trend_add.add_argument("--url", required=True)
     trend_add.add_argument("--text")
     trend_add.add_argument("--username")
+    trend_add.add_argument(
+        "--external",
+        action="store_true",
+        help="Mark this as a Hermes-discovered external trend candidate",
+    )
     trend_add.add_argument("--dry-run", action="store_true")
     trend_list = trend_sub.add_parser(
         "list", help="List this account's trend candidates (read-only)"
@@ -341,15 +346,30 @@ def _run_trend_add(
     url: str,
     text: str | None,
     username: str | None,
+    external: bool,
     dry_run: bool,
 ) -> tuple[int, dict[str, Any]]:
     # The selected --account is authoritative: target_account_id always comes
     # from config.name; there is no flag to override it.
+    candidate_role = "external_trend" if external else "manual_ingress"
+    external_metadata = (
+        {
+            "manual": False,
+            "discovery_method": "hermes_external",
+            "candidate_roles": ["external_trend"],
+            "discovery_methods": ["hermes_external"],
+            "discovered_by": "hermes",
+        }
+        if external
+        else None
+    )
     candidate = trend_candidate_payload(
         config.name,
         url,
+        candidate_role=candidate_role,
         source_username=username,
         source_text=text,
+        raw_metadata=external_metadata,
     )
     if dry_run:
         return 0, {
@@ -360,7 +380,11 @@ def _run_trend_add(
             "candidate": candidate,
         }
     result = _store(config).insert_trend_candidate(
-        url, source_username=username, source_text=text
+        url,
+        candidate_role=candidate_role,
+        source_username=username,
+        source_text=text,
+        raw_metadata=external_metadata,
     )
     return 0, {
         "ok": True,
@@ -505,6 +529,7 @@ def main(
                 url=args.url,
                 text=args.text,
                 username=args.username,
+                external=args.external,
                 dry_run=args.dry_run,
             )
         elif args.command == "trend" and args.trend_command == "list":

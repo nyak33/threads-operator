@@ -15,6 +15,7 @@ Portable multi-account runtime with deterministic draft ingress and production s
 - Unified CLI for accounts, doctor, Insights, Activity, draft ingress, and publishing.
 - Optional Hermes-generated-content boundary: Hermes owns model/provider credentials; Threads Operator accepts generated text only as `draft`.
 - Account-scoped `enqueue-draft` path that never constructs the Threads publishing API.
+- Explicit Hermes external-trend ingress that preserves provenance separately from manual URL ingestion.
 - Official Threads API host validation before credentials can be sent.
 - Forward Supabase privilege-hardening migration.
 - GitHub Actions hardening with read-only permissions, immutable action SHAs, and dependency vulnerability auditing.
@@ -29,7 +30,8 @@ Portable multi-account runtime with deterministic draft ingress and production s
 3. Establish separate browser profiles only where Activity collection is required.
 4. Run `doctor`, Insights validation, Activity dry-run where applicable, and publish dry-run for every account.
 5. Keep live posting disabled until those account-level checks pass.
-6. Optionally configure Hermes-owned content generation per deployment; no LLM key is added to Threads Operator.
+6. Configure Hermes external-trend discovery on deployments that need competitor/content-idea collection; ingest with `trend add --external`, enrich new rows, and alert only on newly inserted candidates.
+7. Optionally configure Hermes-owned content generation per deployment; no LLM key is added to Threads Operator.
 
 ## Deliberately Later / Non-Goals
 
