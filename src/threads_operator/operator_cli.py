@@ -18,6 +18,17 @@ from .account_config import (
 )
 from .activity_collector import collect_activity_follows
 from .collector import collect_once
+from .engagement_queue import (
+    ENGAGEMENT_STATUSES,
+    approve_reply,
+    claim_approved_reply,
+    edit_pending_reply,
+    list_actions,
+    mark_reply_failed,
+    mark_reply_posted,
+    propose_reply,
+    reject_reply,
+)
 from .publish_worker import publish_next_with_recovery
 from .publisher import publish_next
 from .safe_errors import redact_error
@@ -78,6 +89,63 @@ def _parser() -> argparse.ArgumentParser:
     worker.add_argument("--campaign-code")
     worker.add_argument("--dry-run", action="store_true")
 
+
+    engagement = sub.add_parser(
+        "engagement", help="Manage approval-gated engagement actions"
+    )
+    engagement_sub = engagement.add_subparsers(
+        dest="engagement_command", required=True
+    )
+
+    engagement_propose = engagement_sub.add_parser(
+        "propose-reply",
+        help="Queue a Hermes-generated reply for explicit Telebot approval",
+    )
+    engagement_propose.add_argument("--account")
+    engagement_propose.add_argument("--source-post-id", required=True)
+    engagement_propose.add_argument("--url", required=True)
+    engagement_propose.add_argument("--text", required=True)
+    engagement_propose.add_argument("--username")
+    engagement_propose.add_argument("--source-text")
+    engagement_propose.add_argument("--candidate-id", type=int)
+    engagement_propose.add_argument("--score", type=float)
+    engagement_propose.add_argument("--reason")
+    engagement_propose.add_argument("--expires-at")
+
+    engagement_list = engagement_sub.add_parser(
+        "list", help="List engagement actions for this account"
+    )
+    engagement_list.add_argument("--account")
+    engagement_list.add_argument("--status", choices=sorted(ENGAGEMENT_STATUSES))
+    engagement_list.add_argument("--limit", type=int, default=20)
+
+    engagement_approve = engagement_sub.add_parser(
+        "approve", help="Approve one pending reply from Telebot"
+    )
+    engagement_approve.add_argument("--account")
+    engagement_approve.add_argument("--id", type=int, required=True)
+    engagement_approve.add_argument("--approval-ref")
+
+    engagement_reject = engagement_sub.add_parser(
+        "reject", help="Reject one pending reply from Telebot"
+    )
+    engagement_reject.add_argument("--account")
+    engagement_reject.add_argument("--id", type=int, required=True)
+    engagement_reject.add_argument("--approval-ref")
+
+    engagement_edit = engagement_sub.add_parser(
+        "edit", help="Edit a pending reply without approving it"
+    )
+    engagement_edit.add_argument("--account")
+    engagement_edit.add_argument("--id", type=int, required=True)
+    engagement_edit.add_argument("--text", required=True)
+
+    engagement_execute = engagement_sub.add_parser(
+        "execute", help="Execute one explicitly approved engagement reply"
+    )
+    engagement_execute.add_argument("--account")
+    engagement_execute.add_argument("--id", type=int, required=True)
+    engagement_execute.add_argument("--dry-run", action="store_true")
 
     trend = sub.add_parser(
         "trend", help="Manage trend content-discovery candidates"
@@ -181,6 +249,7 @@ def _doctor(config: AccountConfig) -> dict[str, Any]:
     checks["execution_mode"] = mode
     checks["posting_enabled"] = config.get_bool("THREADS_POSTING_ENABLED")
     checks["activity_enabled"] = config.get_bool("ACTIVITY_FOLLOW_COLLECTOR_ENABLED")
+    checks["engagement_enabled"] = config.get_bool("THREADS_ENGAGEMENT_ENABLED")
 
     browser_profile = config.get("THREADS_BROWSER_PROFILE", "") or ""
     if checks["activity_enabled"]:
@@ -338,6 +407,149 @@ def _run_publish_worker(
     failed = result.get("status") == "failed"
     recovered = bool(result.get("requeued"))
     return (1 if failed and not recovered else 0), result
+
+
+def _run_engagement_propose_reply(
+    config: AccountConfig,
+    *,
+    source_post_id: str,
+    url: str,
+    text: str,
+    username: str | None,
+    source_text: str | None,
+    candidate_id: int | None,
+    score: float | None,
+    reason: str | None,
+    expires_at: str | None,
+) -> tuple[int, dict[str, Any]]:
+    result = propose_reply(
+        _store(config),
+        source_post_id=source_post_id,
+        source_permalink=url,
+        proposed_text=text,
+        source_username=username,
+        source_text=source_text,
+        trend_candidate_id=candidate_id,
+        score=score,
+        reason=reason,
+        expires_at=expires_at,
+    )
+    return 0, {"ok": True, "account": config.name, **result}
+
+
+def _run_engagement_list(
+    config: AccountConfig, *, status: str | None, limit: int
+) -> tuple[int, dict[str, Any]]:
+    rows = list_actions(_store(config), status=status, limit=limit)
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "count": len(rows),
+        "actions": rows,
+    }
+
+
+def _run_engagement_approve(
+    config: AccountConfig, *, engagement_id: int, approval_ref: str | None
+) -> tuple[int, dict[str, Any]]:
+    row = approve_reply(_store(config), engagement_id, approval_ref=approval_ref)
+    if row is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "Reply is not pending approval or does not belong to this account",
+        }
+    return 0, {"ok": True, "account": config.name, "action": row}
+
+
+def _run_engagement_reject(
+    config: AccountConfig, *, engagement_id: int, approval_ref: str | None
+) -> tuple[int, dict[str, Any]]:
+    row = reject_reply(_store(config), engagement_id, approval_ref=approval_ref)
+    if row is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "Reply is not pending approval or does not belong to this account",
+        }
+    return 0, {"ok": True, "account": config.name, "action": row}
+
+
+def _run_engagement_edit(
+    config: AccountConfig, *, engagement_id: int, text: str
+) -> tuple[int, dict[str, Any]]:
+    row = edit_pending_reply(_store(config), engagement_id, proposed_text=text)
+    if row is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "Reply is not pending approval or does not belong to this account",
+        }
+    return 0, {"ok": True, "account": config.name, "action": row}
+
+
+def _run_engagement_execute(
+    config: AccountConfig, *, engagement_id: int, dry_run: bool
+) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    rows = list_actions(store, status="approved", limit=100)
+    target = next((row for row in rows if row.get("id") == engagement_id), None)
+    if dry_run:
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "dry_run": True,
+            "eligible": target is not None,
+            "action": target,
+        }
+    if not config.get_bool("THREADS_ENGAGEMENT_ENABLED"):
+        return 3, {
+            "ok": False,
+            "account": config.name,
+            "error": "Live engagement is disabled; require THREADS_ENGAGEMENT_ENABLED=true",
+        }
+
+    row = claim_approved_reply(store, engagement_id)
+    if row is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "Reply is not approved or does not belong to this account",
+        }
+    if row.get("action") != "reply":
+        mark_reply_failed(store, engagement_id, error="Only reply execution is enabled")
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "Only reply execution is enabled",
+        }
+
+    try:
+        reply_id = _api(config).publish_text(
+            str(row.get("proposed_text") or ""),
+            reply_to_id=str(row.get("source_post_id") or ""),
+        )
+        posted = mark_reply_posted(
+            store, engagement_id, external_action_id=reply_id
+        )
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "status": "posted",
+            "reply_id": reply_id,
+            "action": posted,
+        }
+    except Exception as exc:
+        error = redact_error(
+            f"{type(exc).__name__}: {exc}", _known_secrets(config)
+        )
+        mark_reply_failed(store, engagement_id, error=error)
+        return 1, {
+            "ok": False,
+            "account": config.name,
+            "status": "failed",
+            "error": error,
+        }
 
 
 def _run_trend_add(
@@ -522,6 +734,39 @@ def main(
                 config,
                 campaign_code=args.campaign_code,
                 dry_run=args.dry_run,
+            )
+        elif args.command == "engagement" and args.engagement_command == "propose-reply":
+            code, payload = _run_engagement_propose_reply(
+                config,
+                source_post_id=args.source_post_id,
+                url=args.url,
+                text=args.text,
+                username=args.username,
+                source_text=args.source_text,
+                candidate_id=args.candidate_id,
+                score=args.score,
+                reason=args.reason,
+                expires_at=args.expires_at,
+            )
+        elif args.command == "engagement" and args.engagement_command == "list":
+            code, payload = _run_engagement_list(
+                config, status=args.status, limit=args.limit
+            )
+        elif args.command == "engagement" and args.engagement_command == "approve":
+            code, payload = _run_engagement_approve(
+                config, engagement_id=args.id, approval_ref=args.approval_ref
+            )
+        elif args.command == "engagement" and args.engagement_command == "reject":
+            code, payload = _run_engagement_reject(
+                config, engagement_id=args.id, approval_ref=args.approval_ref
+            )
+        elif args.command == "engagement" and args.engagement_command == "edit":
+            code, payload = _run_engagement_edit(
+                config, engagement_id=args.id, text=args.text
+            )
+        elif args.command == "engagement" and args.engagement_command == "execute":
+            code, payload = _run_engagement_execute(
+                config, engagement_id=args.id, dry_run=args.dry_run
             )
         elif args.command == "trend" and args.trend_command == "add":
             code, payload = _run_trend_add(

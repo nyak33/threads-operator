@@ -200,3 +200,15 @@ def test_publish_text_permission_error_does_not_retry():
 
     assert created == 1
     assert publish_attempts == 1
+
+
+
+def test_repost_thread_uses_official_repost_endpoint():
+    def handler(request):
+        assert request.method == "POST"
+        assert request.url.path == "/v1.0/1788000000000001/repost"
+        assert form_body(request) == {"access_token": "token"}
+        return httpx.Response(200, json={"id": "repost-1"})
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    assert api.repost_thread("1788000000000001") == "repost-1"
