@@ -54,6 +54,12 @@ threads-operator trend add --account <key> --url <threads-url> [--external] [--d
 threads-operator trend list --account <key> [--status <status>]
 threads-operator trend show --account <key> --id <candidate-id>
 threads-operator trend enrich --account <key> --id <candidate-id>
+threads-operator engagement propose-reply --account <key> --source-post-id <id> --url <url> --text <reply>
+threads-operator engagement list --account <key> --status pending_approval
+threads-operator engagement approve --account <key> --id <engagement-id>
+threads-operator engagement edit --account <key> --id <engagement-id> --text <replacement>
+threads-operator engagement reject --account <key> --id <engagement-id>
+threads-operator engagement execute --account <key> --id <engagement-id> [--dry-run]
 ```
 
 `publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` for the next tick. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
@@ -131,6 +137,30 @@ That records `candidate_role=external_trend`, `discovery_method=hermes_external`
 
 See [`docs/hermes-trend-discovery.md`](docs/hermes-trend-discovery.md) for the scheduled discovery flow.
 
+
+## Approval-Gated Engagement
+
+Hermes may generate short micro-replies for relevant external posts, but it cannot approve its own reply. Proposed replies are inserted into `threads_engagement_queue` as `pending_approval` and surfaced to Telebot.
+
+The allowed reply state flow is:
+
+```text
+pending_approval -> approved -> executing -> posted
+                 -> rejected
+```
+
+Editing a reply keeps it in `pending_approval`. Live execution is separately disabled by default and requires:
+
+```text
+THREADS_ENGAGEMENT_ENABLED=true
+```
+
+Even with that flag enabled, `engagement execute` conditionally claims only an already-`approved` row. The approval transition records the Telebot channel/reference for auditability. Duplicate actions are prevented per account + source permalink + action.
+
+Reply publishing uses the official Threads reply mechanism through `reply_to_id`. The API adapter also exposes the official repost endpoint for the later selective-repost executor. Browser-driven likes remain outside this approval queue module.
+
+See [`docs/hermes-engagement-approval.md`](docs/hermes-engagement-approval.md) for the Telebot workflow and safety boundary.
+
 ## Optional Hermes-Generated Drafts
 
 The default workflow remains external/ChatGPT-created content entering Supabase before Threads Operator executes it.
@@ -171,6 +201,7 @@ For a fresh full deployment, apply the relevant migrations in filename order:
 - `004_threads_publish_queue.sql` for publishing
 - `005_activity_multi_account_upgrade.sql` where relevant for upgraded Activity data
 - `006_security_hardening.sql` to tighten operator table privileges
+- `007_threads_engagement_queue.sql` for approval-gated external engagement actions
 
 Existing deployments that already applied the original single-account Activity migration must use the multi-account upgrade migration described in the runbook rather than dropping historical data.
 
@@ -184,6 +215,8 @@ Existing deployments that already applied the original single-account Activity m
 - missing Insights metrics remain unknown/null;
 - generated content enters the queue as `draft` only;
 - live posting is opt-in per account;
+- live engagement has a separate opt-in kill-switch;
+- Hermes-generated replies require an explicit human approval transition before execution;
 - a lost queue claim never publishes;
 - OAuth/permission failures are not treated as transient readiness failures;
 - the operator does not automate passwords, CAPTCHA or 2FA bypass;
