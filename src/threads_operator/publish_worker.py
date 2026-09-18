@@ -19,6 +19,7 @@ future-scheduled row is never posted early regardless of retries.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -61,6 +62,20 @@ def is_transient_publish_result(result: dict[str, Any]) -> bool:
         # Unclassifiable HTTP error — treat as transient (Meta publish is flaky).
         return True
     # Default: conservative, do not auto-requeue unknown failures.
+    return False
+
+
+def is_rate_limited_publish_result(result: dict[str, Any]) -> bool:
+    """Return True when the failure should wait for the next cron tick."""
+    error = str(result.get("error", "")).lower()
+    if not error:
+        return False
+    if "429" in error or "too many requests" in error or "rate limit" in error:
+        return True
+    if "rate-limit" in error or "throttl" in error:
+        return True
+    if re.search(r"\bcode=(4|17|32|613)\b", error):
+        return True
     return False
 
 
@@ -150,6 +165,10 @@ def publish_next_with_recovery(
 
         attempts += 1
         result["attempts"] = attempts
+        if result.get("requeued") and is_rate_limited_publish_result(result):
+            # Persist the approved state, then yield. Immediate retries make
+            # throttling worse and contradict the intended cron backoff.
+            return result
         if not result.get("requeued") or attempts >= max_attempts:
             return result
         wait = _backoff_seconds(attempts - 1)
