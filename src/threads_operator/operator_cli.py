@@ -21,8 +21,9 @@ from .collector import collect_once
 from .publish_worker import publish_next_with_recovery
 from .publisher import publish_next
 from .safe_errors import redact_error
-from .supabase_store import SupabaseStore
+from .supabase_store import SupabaseStore, TREND_STATUSES, trend_candidate_payload
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
+from .trend_urls import normalize_threads_post_url
 
 _EXECUTION_MODES = {"draft_only", "approval_required", "auto_post"}
 
@@ -76,6 +77,44 @@ def _parser() -> argparse.ArgumentParser:
     worker.add_argument("--account")
     worker.add_argument("--campaign-code")
     worker.add_argument("--dry-run", action="store_true")
+
+
+    trend = sub.add_parser(
+        "trend", help="Manage trend content-discovery candidates"
+    )
+    trend_sub = trend.add_subparsers(dest="trend_command", required=True)
+    trend_add = trend_sub.add_parser(
+        "add",
+        help="Manually add a public Threads post URL as a trend candidate",
+    )
+    trend_add.add_argument("--account")
+    trend_add.add_argument("--url", required=True)
+    trend_add.add_argument("--text")
+    trend_add.add_argument("--username")
+    trend_add.add_argument("--dry-run", action="store_true")
+    trend_list = trend_sub.add_parser(
+        "list", help="List this account's trend candidates (read-only)"
+    )
+    trend_list.add_argument("--account")
+    trend_list.add_argument("--limit", type=int, default=20)
+    trend_list.add_argument("--status", choices=sorted(TREND_STATUSES))
+    trend_show = trend_sub.add_parser(
+        "show", help="Show one trend candidate (read-only)"
+    )
+    trend_show.add_argument("--account")
+    trend_show.add_argument("--id", type=int, required=True)
+    trend_enrich_p = trend_sub.add_parser(
+        "enrich",
+        help=(
+            "Read-only browser enrichment: structured preloader evidence -> "
+            "factual source_post_id update (allowlisted, account-scoped)"
+        ),
+    )
+    trend_enrich_p.add_argument("--account")
+    trend_enrich_p.add_argument("--id", type=int, help="candidate id (live mode)")
+    trend_enrich_p.add_argument("--url", help="permalink (dry-run by URL; else use --id)")
+    trend_enrich_p.add_argument("--dry-run", action="store_true")
+    trend_enrich_p.add_argument("--settle", type=float, default=3.0)
 
     return parser
 
@@ -296,13 +335,137 @@ def _run_publish_worker(
     return (1 if failed and not recovered else 0), result
 
 
+def _run_trend_add(
+    config: AccountConfig,
+    *,
+    url: str,
+    text: str | None,
+    username: str | None,
+    dry_run: bool,
+) -> tuple[int, dict[str, Any]]:
+    # The selected --account is authoritative: target_account_id always comes
+    # from config.name; there is no flag to override it.
+    candidate = trend_candidate_payload(
+        config.name,
+        url,
+        source_username=username,
+        source_text=text,
+    )
+    if dry_run:
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "dry_run": True,
+            "writes": 0,
+            "candidate": candidate,
+        }
+    result = _store(config).insert_trend_candidate(
+        url, source_username=username, source_text=text
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "dry_run": False,
+        **result,
+    }
+
+
+def _run_trend_list(
+    config: AccountConfig, *, limit: int, status: str | None
+) -> tuple[int, dict[str, Any]]:
+    # Read-only: SELECT via store list_trend_candidates; account isolation is
+    # enforced inside the store layer against self.account_key.
+    candidates = _store(config).list_trend_candidates(limit=limit, status=status)
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "writes": 0,
+        "count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+def _run_trend_show(config: AccountConfig, *, candidate_id: int) -> tuple[int, dict[str, Any]]:
+    row = _store(config).get_trend_candidate(candidate_id)
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "writes": 0,
+        "found": row is not None,
+        "candidate": row,
+    }
+
+
+def _run_trend_enrich(
+    config: AccountConfig,
+    *,
+    candidate_id: int | None,
+    url: str | None,
+    dry_run: bool,
+    settle: float,
+) -> tuple[int, dict[str, Any]]:
+    """Deterministic read-only browser enrichment (v2: allowlisted evidence).
+
+    Dry-run NEVER writes; with --id it may construct a read-only store for
+    the account-scoped candidate read. Live mode PATCHes only allowlisted
+    factual evidence through the account-scoped store method.
+    """
+    from .trend_enrich import (
+        enrich_candidate,
+        enrich_candidate_dry_run,
+        enrich_permalink_dry_run,
+    )
+
+    profile_raw = config.get("THREADS_BROWSER_PROFILE", "") or ""
+    if not profile_raw:
+        raise AccountConfigError(
+            "THREADS_BROWSER_PROFILE is required for trend enrichment")
+    profile_dir = Path(profile_raw).expanduser()
+
+    if dry_run:
+        if url:
+            permalink, _username = normalize_threads_post_url(url)
+            result = enrich_permalink_dry_run(
+                permalink=permalink, profile_dir=profile_dir, settle_seconds=settle)
+            return 0, {"ok": True, "account": config.name, **result}
+        if candidate_id is None:
+            raise AccountConfigError(
+                "--url or --id is required with --dry-run")
+        result = enrich_candidate_dry_run(
+            _store(config),
+            candidate_id=candidate_id,
+            profile_dir=profile_dir,
+            settle_seconds=settle,
+        )
+        return 0, {"ok": True, "account": config.name, **result}
+
+    if candidate_id is None:
+        raise AccountConfigError("--id is required for a live enrich")
+    result = enrich_candidate(
+        _store(config),
+        candidate_id=candidate_id,
+        profile_dir=profile_dir,
+        settle_seconds=settle,
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "dry_run": False,
+        "writes": 1 if result["updated"] else 0,
+        **result,
+    }
+
+
 def main(
     argv: list[str] | None = None,
     *,
     process_env: Mapping[str, str] | None = None,
 ) -> int:
     env = process_env if process_env is not None else os.environ
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:  # invalid flags/choices: fail closed, no writes
+        return int(exc.code or 2)
 
     if args.command == "accounts" and args.accounts_command == "list":
         for account in list_accounts(env):
@@ -335,6 +498,28 @@ def main(
                 config,
                 campaign_code=args.campaign_code,
                 dry_run=args.dry_run,
+            )
+        elif args.command == "trend" and args.trend_command == "add":
+            code, payload = _run_trend_add(
+                config,
+                url=args.url,
+                text=args.text,
+                username=args.username,
+                dry_run=args.dry_run,
+            )
+        elif args.command == "trend" and args.trend_command == "list":
+            code, payload = _run_trend_list(
+                config, limit=args.limit, status=args.status
+            )
+        elif args.command == "trend" and args.trend_command == "show":
+            code, payload = _run_trend_show(config, candidate_id=args.id)
+        elif args.command == "trend" and args.trend_command == "enrich":
+            code, payload = _run_trend_enrich(
+                config,
+                candidate_id=args.id,
+                url=args.url,
+                dry_run=args.dry_run,
+                settle=args.settle,
             )
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")

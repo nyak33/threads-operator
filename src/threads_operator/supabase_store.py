@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .threads_api import POST_METRICS, has_usable_metrics
+from .trend_urls import normalize_threads_post_url
 
 # Supabase gateway blips (project-level latency spikes) return 502/503/504 on
 # otherwise-valid GETs. Idempotent reads retry with exponential backoff so one
@@ -71,7 +72,185 @@ ACCOUNT_TABLE = "threads_account_insights_snapshots"
 POST_TABLE = "threads_post_insights_snapshots"
 ACTIVITY_EVENTS_TABLE = "threads_activity_events"
 OWN_POSTS_TABLE = "threads_posts"
+TREND_CANDIDATES_TABLE = "threads_trend_candidates"
+
+# Statuses that exist in the live schema check — do not invent new ones.
+TREND_STATUSES = frozenset(
+    {"discovered", "reviewed", "approved", "rejected", "used", "stale"}
+)
+
+# Explicit SELECT column allowlist: evidence fields only. Analysis fields
+# (topic/tone/score...) are intentionally not fetched or fabricated here;
+# reads pass through whatever the row already contains via the CLI.
+TREND_EVIDENCE_COLUMNS = (
+    "id",
+    "target_account_id",
+    "source_platform",
+    "source_post_id",
+    "source_username",
+    "source_permalink",
+    "source_text",
+    "published_at",
+    "discovered_at",
+    "last_checked_at",
+    "views",
+    "likes",
+    "replies",
+    "reposts",
+    "quotes",
+    "status",
+    "raw_metadata",
+)
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Structured Threads pk shape: numeric id, optionally compound with : . _ -
+# separators (e.g. "1788000000000001" or "555:1788000000000001").
+_PK_RE = re.compile(r"^[0-9][0-9:._-]*$")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,60}$")
+
+
+def _iso_utc_timestamp(value: Any, field: str) -> str:
+    """Strict tz-aware ISO-8601 timestamp; naive/relative values rejected."""
+    import datetime as _dt
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-blank ISO-8601 timestamp string")
+    try:
+        parsed = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} is not a valid ISO-8601 timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must be timezone-aware (UTC) timestamp: {value!r}")
+    return parsed.astimezone(_dt.timezone.utc).isoformat()
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _validated_pk(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("source_post_id must be a non-blank string")
+    if not _PK_RE.fullmatch(value.strip()) or not any(c.isdigit() for c in value):
+        raise ValueError(
+            "source_post_id must look like a structured pk "
+            "(digits with optional :._- separators)"
+        )
+    return value.strip()
+
+
+def _validated_username(value: Any) -> str:
+    if not isinstance(value, str) or not _USERNAME_RE.fullmatch(value.strip()):
+        raise ValueError("source_username must be a plain Threads username")
+    return value.strip()
+
+
+def _validated_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("source_text must be a non-blank string")
+    return value
+
+
+_EVIDENCE_VALIDATORS: dict[str, Any] = {
+    # The ONLY columns trend evidence enrichment may touch. Anything not
+    # here (status, views, topic, analysis fields, raw_metadata,
+    # target_account_id, ...) is rejected by the store method itself.
+    "source_post_id": _validated_pk,
+    "source_username": _validated_username,
+    "source_text": _validated_text,
+    "published_at": lambda v: _iso_utc_timestamp(v, "published_at"),
+    "last_checked_at": lambda v: _iso_utc_timestamp(v, "last_checked_at"),
+    "likes": lambda v: _non_negative_int(v, "likes"),
+    "replies": lambda v: _non_negative_int(v, "replies"),
+    "reposts": lambda v: _non_negative_int(v, "reposts"),
+    "quotes": lambda v: _non_negative_int(v, "quotes"),
+}
+
+
+TREND_CANDIDATE_ROLES = {
+    # Scalar channel FACTS recorded inside raw_metadata at insertion time.
+    # These are NOT analytical roles. "manual_ingress" only records HOW the
+    # row entered the store: manual ingestion alone does NOT imply
+    # external_trend (that analytical role is reserved for a future
+    # explicit external-discovery workflow). "external_trend" remains a
+    # valid legacy value so historical rows keep parsing, but it is no
+    # longer assigned automatically. The proven analytical role
+    # own_performance comes from Activity attribution via the
+    # trend_provenance merge layer (raw_metadata.candidate_roles).
+    "external_trend": {"manual": True, "discovery_method": "manual_url"},
+    "manual_ingress": {"manual": True, "discovery_method": "manual_url"},
+    "own_performance": {"manual": False,
+                        "discovery_method": "activity_attribution"},
+}
+
+
+def trend_candidate_payload(
+    account_key: str,
+    url: str,
+    *,
+    now: str | None = None,
+    candidate_role: str = "manual_ingress",
+    source_username: str | None = None,
+    source_text: str | None = None,
+    published_at: str | None = None,
+    views: int | None = None,
+    likes: int | None = None,
+    replies: int | None = None,
+    reposts: int | None = None,
+    quotes: int | None = None,
+    raw_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the deterministic insert payload for one trend candidate.
+
+    Shared by the live store insert and the CLI dry-run preview so both
+    render the exact same sanitized shape. Analysis fields (topic, tone,
+    trend_score, ...) are intentionally never set here.
+
+    candidate_role selects the raw_metadata scalar channel facts:
+    manual_ingress (default) => manual=true/manual_url — how the row
+    entered the store, with NO analytical role assigned (manual alone is
+    not proof of external_trend); own_performance => manual=
+    false/activity_attribution. external_trend remains accepted only for
+    legacy-compatible callers. Unknown roles are rejected before any write.
+    """
+    permalink, username = normalize_threads_post_url(url)
+    if not account_key:
+        raise ValueError("account_key is required for trend candidate writes")
+    if candidate_role not in TREND_CANDIDATE_ROLES:
+        raise ValueError(
+            "candidate_role must be one of: "
+            + ", ".join(sorted(TREND_CANDIDATE_ROLES)))
+    role_meta = TREND_CANDIDATE_ROLES[candidate_role]
+    payload: dict[str, Any] = {
+        "target_account_id": account_key,
+        "source_platform": "threads",
+        "source_permalink": permalink,
+        "discovered_at": now or SupabaseStore._utc_now(),
+        "raw_metadata": {
+            "candidate_role": candidate_role,
+            **role_meta,
+            **(raw_metadata or {}),
+        },
+    }
+    if username:
+        payload["source_username"] = username
+    if source_username:
+        payload["source_username"] = source_username
+    if source_text:
+        payload["source_text"] = source_text
+    if published_at:
+        payload["published_at"] = published_at
+    for name, value in (
+        ("views", views),
+        ("likes", likes),
+        ("replies", replies),
+        ("reposts", reposts),
+        ("quotes", quotes),
+    ):
+        if value is not None:
+            payload[name] = int(value)
+    return payload
 
 
 class SupabaseStore:
@@ -222,6 +401,341 @@ class SupabaseStore:
         )
         response.raise_for_status()
         return len(new_payloads)
+
+    def insert_trend_candidate(
+        self,
+        url: str,
+        *,
+        candidate_role: str = "manual_ingress",
+        source_username: str | None = None,
+        source_text: str | None = None,
+        published_at: str | None = None,
+        views: int | None = None,
+        likes: int | None = None,
+        replies: int | None = None,
+        reposts: int | None = None,
+        quotes: int | None = None,
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Deterministically insert one public Threads post as a trend candidate.
+
+        target_account_id is ALWAYS derived from self.account_key — callers
+        cannot cross-write another account. Dedup uses the live unique
+        identity (target_account_id, source_permalink); an existing row
+        returns status="existing" with no second insert. source_post_id is
+        left unset (NULL) — never fabricated from the permalink code.
+        """
+        permalink, _username = normalize_threads_post_url(url)
+        account_key = self._require_account_key()
+
+        def _lookup() -> dict[str, Any] | None:
+            response = self.client.get(
+                f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+                headers=self._headers,
+                params={
+                    "target_account_id": f"eq.{account_key}",
+                    "source_permalink": f"eq.{permalink}",
+                    "select": "id,status",
+                    "limit": "1",
+                },
+            )
+            response.raise_for_status()
+            rows = response.json() or []
+            return rows[0] if rows else None
+
+        found = _lookup()
+        if found:
+            return {
+                "status": "existing",
+                "id": found.get("id"),
+                "permalink": permalink,
+            }
+        payload = trend_candidate_payload(
+            account_key,
+            url,
+            candidate_role=candidate_role,
+            source_username=source_username,
+            source_text=source_text,
+            published_at=published_at,
+            views=views,
+            likes=likes,
+            replies=replies,
+            reposts=reposts,
+            quotes=quotes,
+            raw_metadata=raw_metadata,
+        )
+
+        headers = {**self._headers, "Prefer": "return=representation"}
+        response = self.client.post(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=headers,
+            json=payload,
+        )
+        if response.status_code == 409:
+            # Lost a race against an identical insert: the row exists now.
+            found = _lookup()
+            return {
+                "status": "existing",
+                "id": (found or {}).get("id"),
+                "permalink": permalink,
+            }
+        response.raise_for_status()
+        rows = response.json() or []
+        return {
+            "status": "inserted",
+            "id": rows[0].get("id") if rows else None,
+            "permalink": permalink,
+        }
+
+    # ------------------------------------------------------------------ reads
+
+    def list_trend_candidates(
+        self,
+        *,
+        limit: int = 20,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """SELECT-only, account-scoped trend candidate listing.
+
+        Account isolation is enforced here: the filter always uses
+        self.account_key and callers cannot pass another identity. Newest
+        discovered_at first. No writes, no Threads API, no browser, no LLM.
+        """
+        account_key = self._require_account_key()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        if status is not None and status not in TREND_STATUSES:
+            raise ValueError(
+                "status must be one of: " + ", ".join(sorted(TREND_STATUSES))
+            )
+        params: dict[str, Any] = {
+            "select": ",".join(TREND_EVIDENCE_COLUMNS),
+            "target_account_id": f"eq.{account_key}",
+            "order": "discovered_at.desc",
+            "limit": str(limit),
+        }
+        if status:
+            params["status"] = f"eq.{status}"
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params=params,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        return [r for r in rows if isinstance(r, dict)]
+
+    def get_trend_candidate(self, candidate_id: int) -> dict[str, Any] | None:
+        """SELECT one candidate scoped by BOTH id and target_account_id.
+
+        A row belonging to another account reads as missing (KeyError never
+        escapes; returns None). Client-side account check is kept as
+        belt-and-braces against a leaky server-side filter.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params={
+                "select": ",".join(TREND_EVIDENCE_COLUMNS),
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    def update_trend_candidate_evidence(
+        self,
+        *,
+        candidate_id: int,
+        evidence: dict[str, Any],
+        enrichment: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Account-scoped allowlisted factual UPDATE of observed evidence.
+
+        The method itself enforces ``id == candidate_id AND
+        target_account_id == account_key`` on both the merge read and the
+        PATCH — callers cannot pass another identity. A strict allowlist
+        gates every key (status, views, topic, trend_score, analysis
+        fields, raw_metadata, permalink, account id are REJECTED here before
+        any HTTP call), and every value is validated for shape. Absent keys
+        are simply not in the body — this method can never null a field.
+
+        ``enrichment`` facts (e.g. enrichment_source, media_type) are merged
+        over raw_metadata: the existing object is read back account-scoped
+        first and preserved; None raw_metadata merges into {}. A non-dict
+        raw_metadata fails closed without writing. Returns the updated row
+        or None when the account-scoped filter matches nothing (a
+        foreign-account candidate behaves as not found and is never
+        modified).
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        if not isinstance(evidence, dict) or not evidence:
+            raise ValueError("evidence must be a non-empty dict")
+
+        body: dict[str, Any] = {}
+        for key, value in evidence.items():
+            validator = _EVIDENCE_VALIDATORS.get(key)
+            if validator is None:
+                raise ValueError(
+                    f"evidence field {key!r} is not in the allowlist"
+                )
+            body[key] = validator(value)
+
+        if enrichment is not None:
+            if not isinstance(enrichment, dict) or not enrichment:
+                raise ValueError("enrichment must be a non-empty dict when given")
+            existing = self.get_trend_candidate(candidate_id)
+            if existing is None:
+                return None  # not found for THIS account: never modified
+            current_raw = existing.get("raw_metadata")
+            if current_raw is None:
+                current_raw = {}
+            if not isinstance(current_raw, dict):
+                raise ValueError(
+                    "existing raw_metadata is not an object — refusing to overwrite"
+                )
+            merged = {**current_raw, **enrichment}
+            body["raw_metadata"] = merged
+
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    def update_trend_candidate_source_post_id(
+        self, *, candidate_id: int, source_post_id: str
+    ) -> dict[str, Any] | None:
+        """Legacy v1 single-field path — delegates to the v2 evidence method.
+
+        One enforcement point: allowlist, value validation, account-scoped
+        WHERE id AND target_account_id, and never-null semantics all live in
+        update_trend_candidate_evidence.
+        """
+        return self.update_trend_candidate_evidence(
+            candidate_id=candidate_id,
+            evidence={"source_post_id": source_post_id},
+        )
+
+    # ------------------------------------------------------------- provenance
+
+    def find_trend_candidate_by_permalink(
+        self,
+        permalink: str,
+        *,
+        account_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        """SELECT one candidate by the unique (account, permalink) identity.
+
+        ``account_key`` defaults to the store's own account and is ALWAYS
+        part of the filter — callers cannot probe another account. Returns
+        the full evidence-shaped row (id, source_username, raw_metadata,
+        ...) or None. Read-only.
+        """
+        effective = account_key or self._require_account_key()
+        if not effective:
+            raise ValueError("account_key is required for candidate reads")
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params={
+                "target_account_id": f"eq.{effective}",
+                "source_permalink": f"eq.{permalink}",
+                "select": ",".join(TREND_EVIDENCE_COLUMNS),
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        for row in response.json() or []:
+            if isinstance(row, dict) and row.get("target_account_id") == effective:
+                return row
+        return None
+
+    def update_trend_candidate_provenance(
+        self,
+        *,
+        candidate_id: int,
+        raw_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Account-scoped raw_metadata-ONLY provenance UPDATE.
+
+        The blast radius is structurally one column: the request body is
+        exactly ``{"raw_metadata": ...}`` — status, source_text,
+        source_post_id, metrics, views, trend_score, topic, hook_type,
+        tone, why_it_works and adaptation_angle CANNOT be modified through
+        this path. WHERE is always ``id == candidate_id AND
+        target_account_id == self.account_key``; a foreign-account row
+        matches nothing and returns None without any write attempt on it.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        if not isinstance(raw_metadata, dict) or not raw_metadata:
+            raise ValueError("raw_metadata must be a non-empty dict")
+        if not isinstance(raw_metadata.get("candidate_roles"), list) and \
+                not isinstance(raw_metadata.get("discovery_methods"), list) and \
+                not isinstance(raw_metadata.get("activity_attributions"), list):
+            raise ValueError(
+                "provenance update requires at least one provenance list")
+
+        # Read back account-scoped first so a non-dict raw_metadata or a
+        # missing/foreign row can never be clobbered blindly.
+        existing = self.get_trend_candidate(candidate_id)
+        if existing is None:
+            return None
+        current_raw = existing.get("raw_metadata")
+        if current_raw is not None and not isinstance(current_raw, dict):
+            raise ValueError(
+                "existing raw_metadata is not an object — refusing to overwrite")
+
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+            json={"raw_metadata": raw_metadata},
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
 
     def list_posts(self) -> list[dict[str, Any]]:
         response = self.client.get(
