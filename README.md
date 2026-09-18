@@ -78,6 +78,22 @@ Each account can use the same Supabase project or a different one. Account-local
 
 LLM provider credentials do **not** belong in Threads Operator account files. If Hermes is configured to generate content, its model/API credentials stay in Hermes' own global/runtime configuration. Threads Operator receives only the already-generated text. See [`docs/hermes-content-generation.md`](docs/hermes-content-generation.md).
 
+## Account Personas
+
+Public voice/style is account-scoped in versioned Markdown files:
+
+```text
+personas/<account-key>.md
+```
+
+For example, account `syaqir` uses [`personas/syaqir.md`](personas/syaqir.md). Another Threads account should have its own file, such as `personas/brand_a.md`.
+
+Before Hermes generates a reply or other account-voiced text, it must load the persona matching the selected `--account`. Persona resolution is fail-closed: if `personas/<account-key>.md` is missing, Hermes must stop generation and report the missing persona instead of borrowing another account's voice.
+
+Persona files are model-independent. They contain public style/content rules only; Hermes uses whatever provider/model is currently configured as its primary/default model. Do not put provider names, API keys, Threads credentials, Supabase credentials or unnecessary private information in persona files.
+
+See [`personas/README.md`](personas/README.md) for the persona contract.
+
 ## Historical Insights
 
 The Insights subsystem preserves historical account/post snapshots so growth and velocity can be calculated later rather than relying only on live lifetime totals.
@@ -140,7 +156,7 @@ See [`docs/hermes-trend-discovery.md`](docs/hermes-trend-discovery.md) for the s
 
 ## Approval-Gated Engagement
 
-Hermes may generate short micro-replies for relevant external posts, but it cannot approve its own reply. Proposed replies are inserted into `threads_engagement_queue` as `pending_approval` and surfaced to Telebot.
+Hermes may generate short micro-replies for relevant external posts, but it cannot approve its own reply. Before generation, Hermes must load the selected account's exact `personas/<account-key>.md` file. Proposed replies are inserted into `threads_engagement_queue` as `pending_approval` and surfaced to Telebot.
 
 The allowed reply state flow is:
 
@@ -217,6 +233,7 @@ Existing deployments that already applied the original single-account Activity m
 - live posting is opt-in per account;
 - live engagement has a separate opt-in kill-switch;
 - Hermes-generated replies require an explicit human approval transition before execution;
+- account-voiced generation must use the exact matching persona file and never silently fall back to another account's persona;
 - a lost queue claim never publishes;
 - OAuth/permission failures are not treated as transient readiness failures;
 - the operator does not automate passwords, CAPTCHA or 2FA bypass;
