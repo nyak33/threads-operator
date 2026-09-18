@@ -2,7 +2,7 @@
 
 ## Current Milestone
 
-Portable multi-account runtime with deterministic draft ingress and production security hardening.
+Portable multi-account runtime with approval-gated engagement and account-scoped persona support.
 
 ## Done
 
@@ -21,6 +21,9 @@ Portable multi-account runtime with deterministic draft ingress and production s
 - GitHub Actions hardening with read-only permissions, immutable action SHAs, and dependency vulnerability auditing.
 - Bootstrap build-tool hardening to avoid the audited vulnerable setuptools range.
 - Deployment/runbook documentation for shared or separate Supabase layouts.
+- Approval-gated external reply queue with Telebot approve/edit/reject flow and separate live engagement kill-switch.
+- Account-scoped persona contract at `personas/<account-key>.md`; Hermes must load the exact account persona and fail closed if missing.
+- `personas/syaqir.md` defining the current account's natural Malaysian rojak/bapak-bapak reply voice and anti-fabrication rules.
 - Feature-branch verification: compile succeeded, 136 tests passed with 1 skipped, and dependency audit reported no known vulnerabilities.
 
 ## Deployment Next
@@ -31,7 +34,8 @@ Portable multi-account runtime with deterministic draft ingress and production s
 4. Run `doctor`, Insights validation, Activity dry-run where applicable, and publish dry-run for every account.
 5. Keep live posting disabled until those account-level checks pass.
 6. Configure Hermes external-trend discovery on deployments that need competitor/content-idea collection; ingest with `trend add --external`, enrich new rows, and alert only on newly inserted candidates.
-7. Optionally configure Hermes-owned content generation per deployment; no LLM key is added to Threads Operator.
+7. Create/verify `personas/<account-key>.md` for every account before enabling Hermes-generated engagement replies.
+8. Optionally configure Hermes-owned content generation per deployment; no LLM key is added to Threads Operator and no model is hardcoded in the persona workflow.
 
 ## Deliberately Later / Non-Goals
 
