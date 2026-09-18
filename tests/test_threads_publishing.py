@@ -142,3 +142,61 @@ def test_publish_text_does_not_retry_oauth_failure():
     with pytest.raises(httpx.HTTPStatusError):
         api.publish_text("hello", max_attempts=4, retry_delay_seconds=0)
     assert publish_attempts == 1
+
+
+def test_publish_text_rate_limit_yields_without_container_retry():
+    created = 0
+    publish_attempts = 0
+
+    def handler(request):
+        nonlocal created, publish_attempts
+        if request.url.path.endswith("/threads"):
+            created += 1
+            return httpx.Response(200, json={"id": f"creation-{created}"})
+        publish_attempts += 1
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Application request limit reached",
+                    "type": "OAuthException",
+                    "code": 4,
+                }
+            },
+        )
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        api.publish_text("hello", max_attempts=4, retry_delay_seconds=0)
+
+    assert created == 1
+    assert publish_attempts == 1
+
+
+def test_publish_text_permission_error_does_not_retry():
+    created = 0
+    publish_attempts = 0
+
+    def handler(request):
+        nonlocal created, publish_attempts
+        if request.url.path.endswith("/threads"):
+            created += 1
+            return httpx.Response(200, json={"id": f"creation-{created}"})
+        publish_attempts += 1
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Application does not have permission for this action",
+                    "type": "GraphMethodException",
+                    "code": 10,
+                }
+            },
+        )
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        api.publish_text("hello", max_attempts=4, retry_delay_seconds=0)
+
+    assert created == 1
+    assert publish_attempts == 1

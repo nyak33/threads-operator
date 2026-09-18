@@ -133,3 +133,47 @@ def test_failure_after_one_reply_keeps_successful_reply_id_persisted():
     assert store.calls.index(("reply-progress", "queue", 7, ["reply-1"])) < next(
         index for index, call in enumerate(store.calls) if call[0] == "failed"
     )
+
+
+def test_resume_after_main_publish_does_not_duplicate_main():
+    resumed = row(["reply one"])
+    resumed["threads_main_post_id"] = "post-1"
+    resumed["threads_reply_ids"] = []
+    store = FakeStore(resumed)
+    api = FakeAPI(["reply-1"])
+
+    result = publish_next(api, store, "queue")
+
+    assert result["status"] == "posted"
+    assert result["main_post_id"] == "post-1"
+    assert result["reply_ids"] == ["reply-1"]
+    assert api.calls == [("reply one", "post-1")]
+    assert not any(call[0] == "main" for call in store.calls)
+
+
+def test_resume_after_one_reply_continues_from_last_reply():
+    resumed = row(["reply one", "reply two"])
+    resumed["threads_main_post_id"] = "post-1"
+    resumed["threads_reply_ids"] = ["reply-1"]
+    store = FakeStore(resumed)
+    api = FakeAPI(["reply-2"])
+
+    result = publish_next(api, store, "queue")
+
+    assert result["status"] == "posted"
+    assert result["reply_ids"] == ["reply-1", "reply-2"]
+    assert api.calls == [("reply two", "reply-1")]
+    assert ("reply-progress", "queue", 7, ["reply-1", "reply-2"]) in store.calls
+
+
+def test_persisted_reply_ids_without_main_id_fail_closed():
+    inconsistent = row(["reply one"])
+    inconsistent["threads_reply_ids"] = ["reply-1"]
+    store = FakeStore(inconsistent)
+    api = FakeAPI(["unused"])
+
+    result = publish_next(api, store, "queue")
+
+    assert result["status"] == "failed"
+    assert "without threads_main_post_id" in result["error"]
+    assert api.calls == []

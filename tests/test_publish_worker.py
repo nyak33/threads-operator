@@ -1,4 +1,5 @@
 from threads_operator.publish_worker import (
+    is_rate_limited_publish_result,
     is_transient_publish_result,
     publish_next_with_recovery,
 )
@@ -231,3 +232,47 @@ def test_dry_run_never_requeues():
     )
     assert result["status"] == "dry-run"
     assert "requeued" not in result
+
+
+def test_rate_limit_classification_handles_oauth_label():
+    result = {
+        "error": (
+            "HTTPStatusError: Meta publish rejected (400): Meta error: "
+            "message='Application request limit reached', "
+            "type='OAuthException', code=4"
+        )
+    }
+    assert is_rate_limited_publish_result(result)
+    assert is_transient_publish_result(result)
+
+
+def test_rate_limit_is_requeued_but_not_retried_within_run(monkeypatch):
+    class RateLimitedAPI(FakeAPI):
+        def publish_text(self, text, reply_to_id=None):
+            self.calls.append((text, reply_to_id))
+            raise RuntimeError(
+                "HTTPStatusError: Meta publish rejected (400): Meta error: "
+                "message='Application request limit reached', "
+                "type='OAuthException', code=4"
+            )
+
+    api = RateLimitedAPI()
+    store = FakeStore(row=dict(ROW))
+    sleeps = []
+
+    monkeypatch.setattr(
+        "threads_operator.publish_worker.requeue_failed_row",
+        lambda store, table, row_id, error: True,
+    )
+    result = publish_next_with_recovery(
+        api,
+        store,
+        "threads_publish_queue",
+        sleep=sleeps.append,
+    )
+
+    assert result["status"] == "failed"
+    assert result["requeued"] is True
+    assert result["attempts"] == 1
+    assert len(api.calls) == 1
+    assert sleeps == []
