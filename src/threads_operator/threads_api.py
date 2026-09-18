@@ -269,6 +269,14 @@ def _is_non_retryable_publish_error(response: httpx.Response) -> bool:
     error_type = str(error.get("type", "")).lower()
     message = str(error.get("message", "")).lower()
     code = error.get("code")
+    if (
+        response.status_code == 429
+        or code in {4, 17, 32, 613}
+        or "rate limit" in message
+        or "too many requests" in message
+        or "throttl" in message
+    ):
+        return False
     return (
         "oauth" in error_type
         or "permission" in error_type
