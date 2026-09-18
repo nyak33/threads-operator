@@ -117,6 +117,27 @@ class ThreadsAPI:
             raise ValueError("Threads API returned no permalink for this id")
         return data
 
+    def repost_thread(self, thread_id: str) -> str:
+        """Repost one Threads media object and return the created repost id."""
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            raise ValueError("Threads thread id is required")
+        response = self.client.post(
+            f"{self.base_url}/{thread_id}/repost",
+            data={"access_token": self.access_token},
+        )
+        if response.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"Meta repost rejected ({response.status_code}): "
+                f"{_format_error_payload(response)}",
+                request=response.request,
+                response=response,
+            )
+        post_id = response.json().get("id")
+        if not post_id:
+            raise ValueError("Threads repost response did not include id")
+        return str(post_id)
+
     def get_post_insights(self, post_id: str) -> dict[str, int | float | None]:
         return self._get_insights(
             f"{self.base_url}/{post_id}/insights",
