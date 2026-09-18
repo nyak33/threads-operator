@@ -49,7 +49,10 @@ threads-operator insights --account <key>
 threads-operator activity-follow --account <key> --dry-run
 threads-operator enqueue-draft --account <key> --text <text>
 threads-operator publish --account <key> --dry-run
+threads-operator publish-worker --account <key> [--campaign-code <code>] [--dry-run]
 ```
+
+`publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` for the next tick. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
 
 `--account` may be replaced by the operator-wide `THREADS_ACCOUNT` selector, but every account-bound command must resolve exactly one account.
 
