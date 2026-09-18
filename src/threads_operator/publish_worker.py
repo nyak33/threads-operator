@@ -46,7 +46,11 @@ def is_transient_publish_result(result: dict[str, Any]) -> bool:
     error = str(result.get("error", "")).lower()
     if not error:
         return False
-    # Non-recoverable markers first.
+    # Rate limits may be reported by Meta as OAuthException; they are still
+    # recoverable, but must yield to the next cron tick.
+    if is_rate_limited_publish_result(result):
+        return True
+    # Non-recoverable markers after the rate-limit exception above.
     if "oauth" in error or "permission" in error:
         return False
     if "invalid" in error and "token" in error:
