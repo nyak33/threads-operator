@@ -164,18 +164,24 @@ def propose_reply(
     headers = {**store._headers, "Prefer": "return=representation"}
     response = store.client.post(_url(store), headers=headers, json=payload)
     if response.status_code == 409:
-        return propose_reply(
-            store,
-            source_post_id=source_post_id,
-            source_permalink=permalink,
-            proposed_text=proposed_text,
-            source_username=source_username,
-            source_text=source_text,
-            trend_candidate_id=trend_candidate_id,
-            score=score,
-            reason=reason,
-            expires_at=expires_at,
+        # Lost a race against an identical proposal. Re-read once; never
+        # recurse indefinitely if the REST read lags the unique constraint.
+        reread = store.client.get(
+            _url(store),
+            headers=store._headers,
+            params={
+                "account_key": f"eq.{account_key}",
+                "source_permalink": f"eq.{permalink}",
+                "action": "eq.reply",
+                "select": "id,status,proposed_text",
+                "limit": "1",
+            },
         )
+        reread.raise_for_status()
+        rows = reread.json() or []
+        if rows:
+            return {"result": "existing", "action": rows[0]}
+        raise RuntimeError("engagement dedupe conflict but existing row was not readable")
     response.raise_for_status()
     rows = response.json() or []
     if not rows:
