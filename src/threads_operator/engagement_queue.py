@@ -144,7 +144,7 @@ def propose_reply(
     lookup.raise_for_status()
     existing = lookup.json() or []
     if existing:
-        return {"status": "existing", **existing[0]}
+        return {"result": "existing", "action": existing[0]}
 
     payload: dict[str, Any] = {
         "account_key": account_key,
@@ -180,7 +180,7 @@ def propose_reply(
     rows = response.json() or []
     if not rows:
         raise ValueError("engagement insert returned no row")
-    return {"status": "inserted", **rows[0]}
+    return {"result": "inserted", "action": rows[0]}
 
 
 def _transition(
