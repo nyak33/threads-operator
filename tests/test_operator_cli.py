@@ -246,3 +246,125 @@ def test_enqueue_draft_uses_selected_account_without_constructing_threads_api(
         NOW,
     )
     assert payload == {"ok": True, "account": "brand_a", "id": 9, "status": "draft"}
+
+
+
+def test_engagement_execute_is_disabled_by_default(tmp_path, monkeypatch, capsys):
+    write_account(tmp_path, "brand_a")
+
+    class FakeStore:
+        def __init__(self, base_url, service_role_key, account_key=None):
+            pass
+
+    monkeypatch.setattr(operator_cli, "SupabaseStore", FakeStore)
+    monkeypatch.setattr(operator_cli, "list_actions", lambda *a, **k: [])
+    monkeypatch.setattr(
+        operator_cli,
+        "claim_approved_reply",
+        lambda *a, **k: pytest.fail("disabled engagement must not claim"),
+    )
+
+    code = operator_cli.main(
+        ["engagement", "execute", "--account", "brand_a", "--id", "7"],
+        process_env={"THREADS_OPERATOR_HOME": str(tmp_path)},
+    )
+
+    assert code == 3
+    assert "THREADS_ENGAGEMENT_ENABLED=true" in capsys.readouterr().err
+
+
+def test_engagement_approve_delegates_to_pending_transition(
+    tmp_path, monkeypatch, capsys
+):
+    write_account(tmp_path, "brand_a")
+    seen = {}
+
+    class FakeStore:
+        def __init__(self, base_url, service_role_key, account_key=None):
+            seen["account"] = account_key
+
+    def fake_approve(store, engagement_id, approval_ref=None):
+        seen["approve"] = (engagement_id, approval_ref)
+        return {"id": engagement_id, "status": "approved"}
+
+    monkeypatch.setattr(operator_cli, "SupabaseStore", FakeStore)
+    monkeypatch.setattr(operator_cli, "approve_reply", fake_approve)
+
+    code = operator_cli.main(
+        [
+            "engagement",
+            "approve",
+            "--account",
+            "brand_a",
+            "--id",
+            "7",
+            "--approval-ref",
+            "tg:123",
+        ],
+        process_env={"THREADS_OPERATOR_HOME": str(tmp_path)},
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert seen["account"] == "brand_a"
+    assert seen["approve"] == (7, "tg:123")
+    assert payload["action"]["status"] == "approved"
+
+
+def test_engagement_execute_posts_only_claimed_approved_reply(
+    tmp_path, monkeypatch, capsys
+):
+    write_account(
+        tmp_path,
+        "brand_a",
+        "THREADS_ENGAGEMENT_ENABLED=true\n",
+    )
+    seen = {}
+
+    class FakeStore:
+        def __init__(self, base_url, service_role_key, account_key=None):
+            seen["account"] = account_key
+
+    class FakeAPI:
+        def __init__(self, access_token, user_id, base_url):
+            pass
+
+        def publish_text(self, text, reply_to_id=None):
+            seen["publish"] = (text, reply_to_id)
+            return "reply-999"
+
+    monkeypatch.setattr(operator_cli, "SupabaseStore", FakeStore)
+    monkeypatch.setattr(operator_cli, "ThreadsAPI", FakeAPI)
+    monkeypatch.setattr(operator_cli, "list_actions", lambda *a, **k: [])
+    monkeypatch.setattr(
+        operator_cli,
+        "claim_approved_reply",
+        lambda store, engagement_id: {
+            "id": engagement_id,
+            "action": "reply",
+            "status": "executing",
+            "proposed_text": "Natural reply",
+            "source_post_id": "1788000000000001",
+        },
+    )
+    monkeypatch.setattr(
+        operator_cli,
+        "mark_reply_posted",
+        lambda store, engagement_id, external_action_id: {
+            "id": engagement_id,
+            "status": "posted",
+            "external_action_id": external_action_id,
+        },
+    )
+
+    code = operator_cli.main(
+        ["engagement", "execute", "--account", "brand_a", "--id", "7"],
+        process_env={"THREADS_OPERATOR_HOME": str(tmp_path)},
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert seen["account"] == "brand_a"
+    assert seen["publish"] == ("Natural reply", "1788000000000001")
+    assert payload["status"] == "posted"
+    assert payload["reply_id"] == "reply-999"
