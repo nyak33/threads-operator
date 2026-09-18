@@ -18,6 +18,32 @@ Hermes must not:
 - infer approval from silence or unrelated chat text;
 - bypass login, CAPTCHA, 2FA or platform security challenges.
 
+## Persona loading
+
+Reply generation is account-scoped. Before generating any proposed reply, Hermes must load:
+
+```text
+personas/<account-key>.md
+```
+
+For `--account syaqir`, the required file is:
+
+```text
+personas/syaqir.md
+```
+
+Rules:
+
+- use the exact persona matching the selected account key;
+- never silently use another account's persona as fallback;
+- if the persona file is missing, stop reply generation and report the missing file;
+- use whatever provider/model is currently configured as Hermes' primary/default model;
+- do not hardcode a provider or model name into this workflow;
+- apply the persona to wording, tone, language, length and reply behaviour;
+- never fabricate first-person experience or account-owner facts that are not explicitly verified.
+
+The persona is generation context only. Threads Operator remains deterministic and model-agnostic.
+
 ## Proposed reply
 
 A discovered post must have a verified Threads media id before a reply can be queued.
@@ -129,13 +155,16 @@ Hermes can recover pending approval cards after restart:
 
 ## Reply style
 
-Reply drafts should be:
+The selected account persona is authoritative for voice. General engagement rules still apply:
+
 - relevant to the exact source post;
-- short, normally 1-3 sentences;
-- natural Malaysian Malay/English rojak when appropriate;
+- short unless the persona explicitly needs more context;
 - additive rather than paraphrasing the source;
-- no generic "nice sharing" filler;
+- no generic filler;
 - no sales CTA, link or unsolicited promotion;
-- no sensitive/controversial engagement automation.
+- no fabricated personal experience;
+- no sensitive/controversial engagement automation unless explicitly allowed for human review.
+
+For `syaqir`, see [`../personas/syaqir.md`](../personas/syaqir.md).
 
 Main content strategy remains outside this executor. Hermes only generates a micro-reply candidate for approval.
