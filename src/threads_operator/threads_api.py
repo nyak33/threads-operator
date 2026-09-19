@@ -160,9 +160,16 @@ class ThreadsAPI:
         return response.json()
 
     def create_text_container(
-        self, text: str, reply_to_id: str | None = None
+        self,
+        text: str,
+        reply_to_id: str | None = None,
+        topic_tag: str | None = None,
     ) -> str:
-        """Create a Threads TEXT media container and return its creation id."""
+        """Create a Threads TEXT media container and return its creation id.
+
+        ``topic_tag`` (when given) is attached at container creation, which is
+        the request Meta expects it on; it is not part of the publish call.
+        """
         if not text or not text.strip():
             raise ValueError("Threads text must not be empty")
         data: dict[str, str] = {
@@ -172,6 +179,8 @@ class ThreadsAPI:
         }
         if reply_to_id:
             data["reply_to_id"] = str(reply_to_id)
+        if topic_tag and str(topic_tag).strip():
+            data["topic_tag"] = str(topic_tag).strip()
         response = self.client.post(
             f"{self.base_url}/{self.user_id}/threads",
             data=data,
@@ -211,6 +220,7 @@ class ThreadsAPI:
         self,
         text: str,
         reply_to_id: str | None = None,
+        topic_tag: str | None = None,
         *,
         max_attempts: int = 4,
         retry_delay_seconds: float = 2.0,
@@ -232,7 +242,9 @@ class ThreadsAPI:
             raise ValueError("container_retries must be at least 0")
         last_exc: httpx.HTTPStatusError | None = None
         for _ in range(container_retries + 1):
-            creation_id = self.create_text_container(text, reply_to_id=reply_to_id)
+            creation_id = self.create_text_container(
+                text, reply_to_id=reply_to_id, topic_tag=topic_tag
+            )
             for attempt in range(max_attempts):
                 try:
                     return self.publish_container(creation_id)

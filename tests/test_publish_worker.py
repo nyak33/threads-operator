@@ -44,7 +44,7 @@ class FakeAPI:
         self.error = error
         self.calls = []
 
-    def publish_text(self, text, reply_to_id=None):
+    def publish_text(self, text, reply_to_id=None, topic_tag=None):
         self.calls.append((text, reply_to_id))
         if self.fail_at is not None and len(self.calls) == self.fail_at:
             raise RuntimeError(self.error)
@@ -107,7 +107,7 @@ def test_transient_failure_respects_attempt_budget(monkeypatch):
     """Persistent transient failure retries up to max_attempts then yields."""
 
     class AlwaysFailAPI(FakeAPI):
-        def publish_text(self, text, reply_to_id=None):
+        def publish_text(self, text, reply_to_id=None, topic_tag=None):
             raise RuntimeError("HTTPStatusError: 400 Bad Request")
 
     api = AlwaysFailAPI()
@@ -135,7 +135,7 @@ def test_transient_failure_respects_deadline(monkeypatch):
     """A long backoff that would cross the deadline yields to the next tick."""
 
     class AlwaysFailAPI(FakeAPI):
-        def publish_text(self, text, reply_to_id=None):
+        def publish_text(self, text, reply_to_id=None, topic_tag=None):
             raise RuntimeError("HTTPStatusError: 400 Bad Request")
 
     api = AlwaysFailAPI()
@@ -165,7 +165,7 @@ def test_transient_failure_is_requeued(monkeypatch):
     """Persistent transient failure is requeued each pass until attempts run out."""
 
     class AlwaysFailAPI(FakeAPI):
-        def publish_text(self, text, reply_to_id=None):
+        def publish_text(self, text, reply_to_id=None, topic_tag=None):
             raise RuntimeError("HTTPStatusError: 400 Bad Request")
 
     api = AlwaysFailAPI()
@@ -248,7 +248,7 @@ def test_rate_limit_classification_handles_oauth_label():
 
 def test_rate_limit_is_requeued_but_not_retried_within_run(monkeypatch):
     class RateLimitedAPI(FakeAPI):
-        def publish_text(self, text, reply_to_id=None):
+        def publish_text(self, text, reply_to_id=None, topic_tag=None):
             self.calls.append((text, reply_to_id))
             raise RuntimeError(
                 "HTTPStatusError: Meta publish rejected (400): Meta error: "

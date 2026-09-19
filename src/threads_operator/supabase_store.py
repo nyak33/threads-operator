@@ -767,8 +767,13 @@ class SupabaseStore:
         reply_texts: list[str] | None = None,
         campaign_code: str | None = None,
         scheduled_at: str | None = None,
+        topic: str | None = None,
     ) -> dict[str, Any]:
-        """Insert already-generated content as an account-scoped draft only."""
+        """Insert already-generated content as an account-scoped draft only.
+
+        ``topic`` (when given) is written to the queue's topic column so it
+        carries through to the published post's Meta ``topic_tag``.
+        """
         account_key = self._require_account_key()
         if not isinstance(main_post_text, str) or not main_post_text.strip():
             raise ValueError("main_post_text must not be empty")
@@ -786,6 +791,8 @@ class SupabaseStore:
             payload["campaign_code"] = campaign_code
         if scheduled_at:
             payload["scheduled_at"] = scheduled_at
+        if topic and topic.strip():
+            payload["topic"] = topic.strip()
 
         headers = {**self._headers, "Prefer": "return=representation"}
         response = self.client.post(

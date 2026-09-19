@@ -61,6 +61,8 @@ Optional reply-chain content can be supplied by repeating `--reply`:
   --campaign-code HERMES_GENERATED
 ```
 
+Always assign a meaningful, content-specific topic with `--topic` (e.g. `--topic "Local SEO"`, `--topic "Career Upskilling"`). Do not submit drafts with a generic "General" topic when a real one is determinable, and never hardcode one topic across an account's whole output. The topic is stored on the row and published as Meta's `topic_tag` on the root post — see `README.md` § Content Topics.
+
 The command writes only `status=draft`. It never calls a model, never approves the row, and never publishes to Threads.
 
 Hermes should therefore treat generation and queue submission as two separate steps:

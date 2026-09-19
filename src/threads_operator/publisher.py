@@ -6,6 +6,7 @@ from typing import Any
 
 from .supabase_store import SupabaseStore
 from .threads_api import ThreadsAPI
+from .topic import resolve_topic
 
 
 def _reply_texts(row: dict[str, Any]) -> list[str]:
@@ -65,6 +66,12 @@ def publish_next(
             raise ValueError("Claimed queue row has no main_post_text")
         replies = _reply_texts(row)
 
+        # The topic lives on the row, so it survives every claim/requeue/
+        # recovery cycle untouched. It is attached to the root post only —
+        # Meta allows one topic per post, and replies inherit the thread's
+        # context. Missing/blank topics resolve to None and publish untagged.
+        topic_tag = resolve_topic(table, row)
+
         existing_main = row.get("threads_main_post_id")
         if existing_main is not None and str(existing_main).strip():
             main_post_id = str(existing_main)
@@ -87,7 +94,7 @@ def publish_next(
             raise ValueError("Persisted reply progress exceeds configured reply_texts")
 
         if main_post_id is None:
-            main_post_id = api.publish_text(main_text)
+            main_post_id = api.publish_text(main_text, topic_tag=topic_tag)
             store.mark_post_main_published(table, row_id, main_post_id)
 
         parent_id = reply_ids[-1] if reply_ids else main_post_id

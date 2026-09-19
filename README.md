@@ -207,6 +207,26 @@ A dry run may inspect eligible work without claiming or publishing it.
 
 The publisher persists the main Threads post ID before attempting optional replies. If a later step fails, the queue retains known IDs and moves to a visible failed state for reconciliation instead of blindly retrying the whole chain.
 
+## Content Topics
+
+Every content row should carry a meaningful, content-specific topic. At publish time the topic is attached to the **root post** as Meta's `topic_tag` (one topic per post; replies do not carry one). Rows without a topic publish exactly as before — a missing topic never crashes publishing.
+
+Supported queue field mappings (resolved centrally in `src/threads_operator/topic.py`):
+
+- `threads_publish_queue.topic` → Meta `topic_tag`
+- `threads_content_queue.topic_tag` → Meta `topic_tag`
+- `note_to_self_queue.topic_tag` → Meta `topic_tag`
+- `affiliate_queue.topic` → Meta `topic_tag`
+- `hadith_content_queue.topic` → Meta `topic_tag`
+
+How it flows: the queue's topic column is read from the claimed row, normalized to Meta's `topic_tag` rules (1–50 chars, no `. & @ ! ? , ; : #`), and passed on the create-container request in `threads_api.py`. Because the topic lives on the row itself, it survives normal publish, retries, requeues, recovery resumes, and delayed scheduling untouched — the row is never stripped of it.
+
+Rules for content generators (Hermes or any external brain):
+
+1. Assign a specific, meaningful topic per row (e.g. "Local SEO", "Career Upskilling", "Digital Marketing", "Hadith & Reflection"). Do not fall back to a generic "General" when a real topic is determinable.
+2. The topic must be account/content specific — never hardcode one topic globally across an account's whole output.
+3. `enqueue-draft --topic "..."` records the topic at draft creation; prefer setting it there over relying on any DB fallback.
+
 ## Database Migrations
 
 For a fresh full deployment, apply the relevant migrations in filename order:

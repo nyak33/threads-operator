@@ -72,6 +72,10 @@ def _parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--reply", action="append", default=[])
     enqueue.add_argument("--campaign-code")
     enqueue.add_argument("--scheduled-at")
+    enqueue.add_argument(
+        "--topic",
+        help="Meaningful topic for this content (published as the Meta topic_tag).",
+    )
 
     publish = sub.add_parser("publish", help="Publish one approved due queue item")
     publish.add_argument("--account")
@@ -327,6 +331,7 @@ def _run_enqueue_draft(
     replies: list[str],
     campaign_code: str | None,
     scheduled_at: str | None,
+    topic: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
     campaign = campaign_code or config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
@@ -336,6 +341,7 @@ def _run_enqueue_draft(
         reply_texts=replies,
         campaign_code=campaign,
         scheduled_at=scheduled_at,
+        topic=topic,
     )
     return 0, {
         "ok": True,
@@ -745,6 +751,7 @@ def main(
                 replies=args.reply,
                 campaign_code=args.campaign_code,
                 scheduled_at=args.scheduled_at,
+                topic=args.topic,
             )
         elif args.command == "publish":
             code, payload = _run_publish(config, dry_run=args.dry_run)

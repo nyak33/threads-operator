@@ -33,7 +33,7 @@ class FakeAPI:
         self.fail_at = fail_at
         self.calls = []
 
-    def publish_text(self, text, reply_to_id=None):
+    def publish_text(self, text, reply_to_id=None, topic_tag=None):
         self.calls.append((text, reply_to_id))
         if self.fail_at is not None and len(self.calls) == self.fail_at:
             raise RuntimeError("publish exploded")
