@@ -150,6 +150,15 @@ class ThreadsAPI:
             ACCOUNT_METRICS,
         )
 
+    def get_media(self, media_id: str) -> dict[str, Any]:
+        """Look up one media object by Graph API ID. Raises on 400/404."""
+        response = self.client.get(
+            f"{self.base_url}/{media_id}",
+            params=self._params({"fields": "id,permalink,username"}),
+        )
+        response.raise_for_status()
+        return response.json()
+
     def create_text_container(
         self, text: str, reply_to_id: str | None = None
     ) -> str:

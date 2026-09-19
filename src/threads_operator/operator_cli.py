@@ -524,6 +524,25 @@ def _run_engagement_execute(
             "error": "Only reply execution is enabled",
         }
 
+    # Validate the target post is a real Graph API media ID before attempting
+    # to publish. Trend-scraped IDs are web post IDs that the Graph API does
+    # not recognise; without this check the row would burn to `failed`.
+    reply_to_id = str(row.get("source_post_id") or "")
+    if reply_to_id:
+        try:
+            _api(config).get_media(reply_to_id)
+        except Exception as exc:
+            error = redact_error(
+                f"Invalid source_post_id {reply_to_id}: {type(exc).__name__}: {exc}",
+                _known_secrets(config),
+            )
+            return 2, {
+                "ok": False,
+                "account": config.name,
+                "status": "approved",
+                "error": error,
+            }
+
     try:
         reply_id = _api(config).publish_text(
             str(row.get("proposed_text") or ""),

@@ -329,6 +329,10 @@ def test_engagement_execute_posts_only_claimed_approved_reply(
         def __init__(self, access_token, user_id, base_url):
             pass
 
+        def get_media(self, media_id):
+            seen["get_media"] = media_id
+            return {"id": media_id, "permalink": "https://example.com/post"}
+
         def publish_text(self, text, reply_to_id=None):
             seen["publish"] = (text, reply_to_id)
             return "reply-999"
@@ -365,6 +369,7 @@ def test_engagement_execute_posts_only_claimed_approved_reply(
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
     assert seen["account"] == "brand_a"
+    assert seen["get_media"] == "1788000000000001"
     assert seen["publish"] == ("Natural reply", "1788000000000001")
     assert payload["status"] == "posted"
     assert payload["reply_id"] == "reply-999"
