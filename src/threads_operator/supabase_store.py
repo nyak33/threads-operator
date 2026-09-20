@@ -107,6 +107,17 @@ _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PK_RE = re.compile(r"^[0-9][0-9:._-]*$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,60}$")
 
+# Only the deterministic publish queue carries the durable retry-state columns
+# (attempt_count / last_attempt_at / next_retry_at, migration 008). Backoff-aware
+# selection and retry-state persistence are scoped to this table so the other
+# queue tables (engagement, activity, ...) — which lack these columns — are
+# never queried or patched with them.
+RETRY_STATE_TABLES = frozenset({"threads_publish_queue"})
+
+
+def _supports_retry_state(table: str) -> bool:
+    return table in RETRY_STATE_TABLES
+
 
 def _iso_utc_timestamp(value: Any, field: str) -> str:
     """Strict tz-aware ISO-8601 timestamp; naive/relative values rejected."""
@@ -814,20 +825,43 @@ class SupabaseStore:
         now: str | None = None,
     ) -> dict[str, Any] | None:
         account_key = self._require_account_key()
+        now_ts = now or self._utc_now()
         params = {
             "account_key": f"eq.{account_key}",
             "status": "eq.approved",
-            "scheduled_at": f"lte.{now or self._utc_now()}",
+            "scheduled_at": f"lte.{now_ts}",
             "order": "scheduled_at.asc,id.asc",
             "limit": "1",
             "select": "*",
         }
         if campaign_code:
             params["campaign_code"] = f"eq.{campaign_code}"
+        if _supports_retry_state(table):
+            # Skip rows currently in retry backoff. next_retry_at IS NULL means
+            # "not in backoff" (never attempted, or backoff cleared). A future
+            # next_retry_at means the row is waiting out a persisted backoff and
+            # must not be re-selected — this is what stops a repeatedly failing
+            # row from starving every later due row.
+            params["or"] = f"(next_retry_at.is.null,next_retry_at.lte.{now_ts})"
         response = self.client.get(
             self._queue_url(table), headers=self._headers, params=params
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Migration 008 not yet applied: the retry columns do not exist, so
+            # PostgREST rejects the next_retry_at filter with a 400. Fall back
+            # to plain oldest-due selection (pre-fix behaviour) rather than
+            # hard-crashing the worker — the durable fix activates once the
+            # columns are added.
+            if "or" in params and exc.response is not None and exc.response.status_code == 400:
+                params.pop("or", None)
+                response = self.client.get(
+                    self._queue_url(table), headers=self._headers, params=params
+                )
+                response.raise_for_status()
+            else:
+                raise
         rows = response.json() or []
         return rows[0] if rows else None
 
@@ -898,22 +932,67 @@ class SupabaseStore:
         *,
         posted_at: str | None = None,
     ) -> None:
-        self._patch_queue_row(
-            table,
-            row_id,
-            {
-                "status": "posted",
-                "threads_reply_ids": list(reply_ids),
-                "posted_at": posted_at or self._utc_now(),
-                "last_error": None,
-            },
-        )
+        payload: dict[str, Any] = {
+            "status": "posted",
+            "threads_reply_ids": list(reply_ids),
+            "posted_at": posted_at or self._utc_now(),
+            "last_error": None,
+        }
+        if _supports_retry_state(table):
+            # Success: clear the retry state so the row is terminal and clean.
+            payload["next_retry_at"] = None
+        self._patch_queue_row(table, row_id, payload)
 
     def mark_post_failed(
-        self, table: str, row_id: int | str, error: str
+        self,
+        table: str,
+        row_id: int | str,
+        error: str,
+        *,
+        clear_next_retry: bool = True,
     ) -> None:
-        self._patch_queue_row(
-            table,
-            row_id,
-            {"status": "failed", "last_error": str(error)[:2000]},
+        payload: dict[str, Any] = {"status": "failed", "last_error": str(error)[:2000]}
+        if _supports_retry_state(table) and clear_next_retry:
+            # Terminal failure: stop any further retry scheduling. A row that is
+            # manually requeued (status -> approved) resets next_retry_at to NULL
+            # via requeue paths so it becomes eligible again.
+            payload["next_retry_at"] = None
+        self._patch_queue_row(table, row_id, payload)
+
+    def record_publish_attempt(
+        self,
+        table: str,
+        row_id: int | str,
+        *,
+        attempt_count: int,
+        attempted_at: str | None = None,
+        next_retry_at: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Persist retry state for a row without changing its status.
+
+        Used by the recovery worker to stamp the durable attempt counter and the
+        backoff gate (``next_retry_at``) after every publish attempt. Only
+        applies to tables that carry the retry-state columns; a no-op otherwise.
+        """
+        if not _supports_retry_state(table):
+            return
+        payload: dict[str, Any] = {
+            "attempt_count": int(attempt_count),
+            "last_attempt_at": attempted_at or self._utc_now(),
+            "next_retry_at": next_retry_at,
+        }
+        if last_error is not None:
+            payload["last_error"] = str(last_error)[:2000]
+        self._patch_queue_row(table, row_id, payload)
+
+    def fetch_queue_row(self, table: str, row_id: int | str) -> dict[str, Any] | None:
+        account_key = self._require_account_key()
+        response = self.client.get(
+            self._queue_url(table),
+            headers=self._headers,
+            params={"id": f"eq.{row_id}", "account_key": f"eq.{account_key}", "select": "*"},
         )
+        response.raise_for_status()
+        rows = response.json() or []
+        return rows[0] if rows else None

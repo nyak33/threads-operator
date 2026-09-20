@@ -87,9 +87,11 @@ def test_transient_failure_retries_within_run_and_recovers(monkeypatch):
     store = FakeStore(row=dict(ROW))
     sleeps = []
 
+    def requeue_ok(store, table, row_id, error, **kwargs):
+        return True
+
     monkeypatch.setattr(
-        "threads_operator.publish_worker.requeue_failed_row",
-        lambda store, table, row_id, error: True,
+        "threads_operator.publish_worker.requeue_failed_row", requeue_ok
     )
     result = publish_next_with_recovery(
         api,
@@ -97,14 +99,16 @@ def test_transient_failure_retries_within_run_and_recovers(monkeypatch):
         "threads_publish_queue",
         sleep=sleeps.append,
     )
-    assert result["status"] == "posted"
-    assert result["main_post_id"] == "p1"
-    assert result["attempts"] == 2
-    assert sleeps == [2.0]
+    assert result["requeued"] is True
+    assert result["attempts"] == 1
+    # Transient failure defers to a persisted backoff gate for the next tick
+    # rather than retrying in a tight in-run loop.
+    assert result.get("next_retry_at") is not None
 
 
 def test_transient_failure_respects_attempt_budget(monkeypatch):
-    """Persistent transient failure retries up to max_attempts then yields."""
+    """A persistent transient failure is requeued with backoff each tick; the
+    durable max-attempts cap (not in-run sleeps) eventually stops it."""
 
     class AlwaysFailAPI(FakeAPI):
         def publish_text(self, text, reply_to_id=None, topic_tag=None):
@@ -116,23 +120,24 @@ def test_transient_failure_respects_attempt_budget(monkeypatch):
 
     monkeypatch.setattr(
         "threads_operator.publish_worker.requeue_failed_row",
-        lambda store, table, row_id, error: True,
+        lambda store, table, row_id, error, **kw: True,
     )
     result = publish_next_with_recovery(
         api,
         store,
         "threads_publish_queue",
-        max_attempts=3,
         sleep=sleeps.append,
     )
     assert result["status"] == "failed"
-    assert result["attempts"] == 3
     assert result["requeued"] is True
-    assert sleeps == [2.0, 5.0]
+    # One attempt per tick; backoff is persisted for the next tick (no in-run
+    # sleep loop).
+    assert result["next_retry_at"] is not None
+    assert sleeps == []
 
 
 def test_transient_failure_respects_deadline(monkeypatch):
-    """A long backoff that would cross the deadline yields to the next tick."""
+    """A transient failure always yields to the next tick (no in-run sleep)."""
 
     class AlwaysFailAPI(FakeAPI):
         def publish_text(self, text, reply_to_id=None, topic_tag=None):
@@ -145,24 +150,24 @@ def test_transient_failure_respects_deadline(monkeypatch):
 
     monkeypatch.setattr(
         "threads_operator.publish_worker.requeue_failed_row",
-        lambda store, table, row_id, error: True,
+        lambda store, table, row_id, error, **kw: True,
     )
     result = publish_next_with_recovery(
         api,
         store,
         "threads_publish_queue",
-        attempt_deadline_seconds=1.0,  # shorter than first backoff (2.0s)
+        attempt_deadline_seconds=1.0,
         sleep=sleeps.append,
         clock=lambda: now[0],
     )
     assert result["status"] == "failed"
     assert result["attempts"] == 1
     assert result["requeued"] is True
-    assert sleeps == []  # yielded to next tick instead of sleeping past deadline
+    assert sleeps == []  # yielded to next tick, never slept in-run
 
 
 def test_transient_failure_is_requeued(monkeypatch):
-    """Persistent transient failure is requeued each pass until attempts run out."""
+    """Persistent transient failure is requeued with a persisted backoff."""
 
     class AlwaysFailAPI(FakeAPI):
         def publish_text(self, text, reply_to_id=None, topic_tag=None):
@@ -173,9 +178,11 @@ def test_transient_failure_is_requeued(monkeypatch):
 
     requeued = {}
 
-    def fake_requeue(store_arg, table, row_id, error):
+    def fake_requeue(store_arg, table, row_id, error, **kw):
         requeued["row_id"] = row_id
         requeued["error"] = error
+        requeued["next_retry_at"] = kw.get("next_retry_at")
+        requeued["attempt_count"] = kw.get("attempt_count")
         return True
 
     monkeypatch.setattr(
@@ -185,11 +192,12 @@ def test_transient_failure_is_requeued(monkeypatch):
         api,
         store,
         "threads_publish_queue",
-        max_attempts=1,
     )
     assert result["status"] == "failed"
     assert result.get("requeued") is True
     assert requeued["row_id"] == 9
+    assert requeued["next_retry_at"] is not None
+    assert requeued["attempt_count"] == 1
 
 
 def test_non_transient_failure_stays_failed(monkeypatch):
@@ -198,7 +206,7 @@ def test_non_transient_failure_stays_failed(monkeypatch):
 
     called = []
 
-    def fake_requeue(store_arg, table, row_id, error):
+    def fake_requeue(store_arg, table, row_id, error, **kw):
         called.append(row_id)
         return True
 
@@ -212,10 +220,14 @@ def test_non_transient_failure_stays_failed(monkeypatch):
 
 
 def test_requeue_failure_does_not_mask_original_error(monkeypatch):
-    api = FakeAPI(fail_at=1, error="HTTPStatusError: 400 Bad Request")
+    class FailAPI(FakeAPI):
+        def publish_text(self, text, reply_to_id=None, topic_tag=None):
+            raise RuntimeError("HTTPStatusError: 400 Bad Request")
+
+    api = FailAPI()
     store = FakeStore(row=dict(ROW))
 
-    def boom(store_arg, table, row_id, error):
+    def boom(store_arg, table, row_id, error, **kw):
         raise RuntimeError("db down")
 
     monkeypatch.setattr("threads_operator.publish_worker.requeue_failed_row", boom)
@@ -262,7 +274,7 @@ def test_rate_limit_is_requeued_but_not_retried_within_run(monkeypatch):
 
     monkeypatch.setattr(
         "threads_operator.publish_worker.requeue_failed_row",
-        lambda store, table, row_id, error: True,
+        lambda store, table, row_id, error, **kw: True,
     )
     result = publish_next_with_recovery(
         api,

@@ -60,6 +60,7 @@ def publish_next(
 
     main_post_id: str | None = None
     reply_ids: list[str] = []
+    step = "main"
     try:
         main_text = row.get("main_post_text")
         if not isinstance(main_text, str) or not main_text.strip():
@@ -94,11 +95,13 @@ def publish_next(
             raise ValueError("Persisted reply progress exceeds configured reply_texts")
 
         if main_post_id is None:
+            step = "main"
             main_post_id = api.publish_text(main_text, topic_tag=topic_tag)
             store.mark_post_main_published(table, row_id, main_post_id)
 
         parent_id = reply_ids[-1] if reply_ids else main_post_id
-        for reply_text in replies[len(reply_ids):]:
+        for index, reply_text in enumerate(replies[len(reply_ids):], start=len(reply_ids) + 1):
+            step = f"reply {index}/{len(replies)} (parent {parent_id})"
             reply_id = api.publish_text(reply_text, reply_to_id=parent_id)
             reply_ids.append(reply_id)
             store.mark_post_reply_progress(table, row_id, reply_ids)
