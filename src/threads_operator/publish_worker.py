@@ -51,6 +51,15 @@ PERSISTED_BACKOFF_SECONDS = (300, 900, 1800, 3600, 7200)  # 5m,15m,30m,1h,2h
 # the same account), preserving claim safety and recovery guarantees.
 DEFAULT_MAX_ROWS_PER_RUN = 3
 
+# Stale-claim watchdog policy: a row in 'posting' whose heartbeat (falling back
+# to claimed_at) has not advanced for this long means the worker died mid-
+# thread. The next run re-claims it via CAS and RESUMES from the persisted
+# checkpoint (root never recreated, replies reconciled live before republish).
+DEFAULT_STALE_HEARTBEAT_SECONDS = 600.0  # 10 minutes
+# An incomplete thread older than this is alert-worthy even when a heartbeat
+# looks alive (worker stuck inside one long call, or reclaim keeps failing).
+DEFAULT_INCOMPLETE_ALERT_SECONDS = 1800.0  # 30 minutes
+
 # Structured Meta errors that must never be auto-requeued: (code, subcode).
 # code 24 / subcode 4279009 is the observed "resource does not exist" content
 # rejection — permanent as-coded, manual review only.
@@ -359,6 +368,7 @@ def publish_next_with_recovery(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_persisted_attempts: int = DEFAULT_MAX_PERSISTED_ATTEMPTS,
     max_rows_per_run: int = DEFAULT_MAX_ROWS_PER_RUN,
+    stale_seconds: float = DEFAULT_STALE_HEARTBEAT_SECONDS,
     sleep: Any = time.sleep,
     clock: Any = time.monotonic,
     alert: Any = None,
@@ -385,7 +395,44 @@ def publish_next_with_recovery(
     processed: list[dict[str, Any]] = []
     seen_ids: set = set()
     last_result: dict[str, Any] = {"status": "no_due_posts"}
-    for _ in range(max(1, max_rows_per_run)):
+
+    # --- Phase 0: reclaim half-published threads whose worker died ---------
+    # A row stuck in ``posting`` with a heartbeat older than
+    # DEFAULT_STALE_HEARTBEAT_SECONDS can never be picked up by the approved
+    # path. Reclaim each one with a CAS update (healthy, actively-beating rows
+    # are never stolen) and resume it through the reconciling publisher — the
+    # root is never recreated and confirmed replies are adopted, not republished.
+    try:
+        stale_rows = store.reclaim_stale_posting_rows(
+            table, stale_seconds=stale_seconds, limit=max(1, max_rows_per_run)
+        )
+    except Exception:
+        stale_rows = []
+    for claimed in stale_rows:
+        qid = claimed.get("id")
+        if qid is None or qid in seen_ids:
+            continue
+        seen_ids.add(qid)
+        resume_result = publish_next(
+            api, store, table, campaign_code=campaign_code, claimed_row=claimed
+        )
+        resume_result["reclaimed_stale"] = True
+        processed.append(resume_result)
+        last_result = resume_result
+        if resume_result.get("status") == "failed" and alert is not None:
+            alert(
+                store,
+                table,
+                qid,
+                resume_result,
+                int(claimed.get("attempt_count") or 0),
+                str(resume_result.get("error", "")),
+                reason="stale_reclaim",
+            )
+
+    # --- Phase 1: normal due-row processing ---------------------------------
+    remaining = max(0, max_rows_per_run - len(processed))
+    for _ in range(max(1, remaining) if remaining else 0):
         result = _process_one_row(
             api,
             store,

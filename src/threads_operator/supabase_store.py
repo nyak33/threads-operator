@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pathlib
 import re
 import time
@@ -883,6 +883,9 @@ class SupabaseStore:
         if row_id is None:
             raise ValueError("Queue row is missing id")
         headers = {**self._headers, "Prefer": "return=representation"}
+        claim_payload = {"status": "posting", "claimed_at": claimed_at}
+        if _supports_retry_state(table):
+            claim_payload = {**claim_payload, "heartbeat_at": claimed_at}
         response = self.client.patch(
             self._queue_url(table),
             headers=headers,
@@ -891,8 +894,22 @@ class SupabaseStore:
                 "account_key": f"eq.{account_key}",
                 "status": "eq.approved",
             },
-            json={"status": "posting", "claimed_at": claimed_at},
+            json=claim_payload,
         )
+        if response.status_code == 400 and "heartbeat_at" in claim_payload:
+            # Migration 009 not applied: drop the heartbeat field and retry the
+            # identical CAS claim (a genuine claim race returns 200 + [], not
+            # 400, so this fallback cannot mask a lost race).
+            response = self.client.patch(
+                self._queue_url(table),
+                headers=headers,
+                params={
+                    "id": f"eq.{row_id}",
+                    "account_key": f"eq.{account_key}",
+                    "status": "eq.approved",
+                },
+                json={"status": "posting", "claimed_at": claimed_at},
+            )
         response.raise_for_status()
         rows = response.json() or []
         return rows[0] if rows else None
@@ -910,9 +927,143 @@ class SupabaseStore:
         )
         response.raise_for_status()
 
+    def _patch_queue_row_with_heartbeat(
+        self, table: str, row_id: int | str, payload: dict[str, Any]
+    ) -> None:
+        """PATCH the row plus a fresh ``heartbeat_at`` in one write.
+
+        Every durable progress checkpoint (claim, root persisted, reply
+        persisted, completion) doubles as a heartbeat, so a live worker is
+        always distinguishable from a crashed one without extra API calls.
+        Degrades gracefully when migration 009 has not been applied: the first
+        attempt 400s on the unknown column, the retry drops it.
+        """
+        account_key = self._require_account_key()
+        headers = {**self._headers, "Prefer": "return=minimal"}
+        params = {"id": f"eq.{row_id}", "account_key": f"eq.{account_key}"}
+        stamped = {**payload, "heartbeat_at": self._utc_now()}
+        response = self.client.patch(
+            self._queue_url(table), headers=headers, params=params, json=stamped
+        )
+        if response.status_code == 400 and "heartbeat_at" in str(response.text):
+            response = self.client.patch(
+                self._queue_url(table), headers=headers, params=params, json=payload
+            )
+        response.raise_for_status()
+
+    def touch_post_heartbeat(self, table: str, row_id: int | str) -> bool:
+        """Advance ``heartbeat_at`` on a row still being published.
+
+        Called on claim, root publish/persist, every reply publish/persist and
+        completion, so any observer can tell a live worker from a dead one.
+        Returns True when the heartbeat was written. Tables without the
+        heartbeat column (migration 009 not applied) degrade to False so the
+        worker keeps running on claimed_at-based staleness instead.
+        """
+        if not _supports_retry_state(table):
+            return False
+        try:
+            self._patch_queue_row_with_heartbeat(table, row_id, {})
+            return True
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 400:
+                return False
+            raise
+
+    def reclaim_stale_posting_rows(
+        self,
+        table: str,
+        *,
+        stale_seconds: float = 600.0,
+        limit: int = 3,
+        now: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Safely re-claim ``posting`` rows whose worker died mid-thread.
+
+        A row stays ``posting`` (no status flip, so no second worker can pick it
+        up through the approved path). The claim is won with a CAS PATCH: the
+        update only lands while the row is still ``posting`` AND its last
+        heartbeat (falling back to claimed_at, then updated_at when the
+        heartbeat column is absent) is older than ``stale_seconds``. The winner
+        rewrites claimed_at + heartbeat_at atomically; losers get zero rows.
+        Resumability comes from the persisted checkpoint (main id + reply ids) —
+        the resuming worker reconciles live state before publishing anything.
+        """
+        account_key = self._require_account_key()
+        now_dt = datetime.fromisoformat((now or self._utc_now()).replace("Z", "+00:00"))
+        cutoff = (now_dt - timedelta(seconds=stale_seconds)).isoformat()
+        headers = {**self._headers, "Prefer": "return=representation"}
+        # Prefer the heartbeat column; degrade to claimed_at when migration 009
+        # has not been applied yet (PostgREST 400 on unknown column).
+        filter_sets = [
+            {"or": f"(heartbeat_at.lt.{cutoff},and(heartbeat_at.is.null,claimed_at.lt.{cutoff}))"},
+            {"claimed_at": f"lt.{cutoff}"},
+        ]
+        rows: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        extra: dict[str, str] = filter_sets[-1]
+        for candidate_filter in filter_sets:
+            extra = candidate_filter
+            params = {
+                "account_key": f"eq.{account_key}",
+                "status": "eq.posting",
+                "order": "claimed_at.asc,id.asc",
+                "limit": str(limit),
+                "select": "id",
+                **extra,
+            }
+            response = self.client.get(
+                self._queue_url(table), headers=self._headers, params=params
+            )
+            if response.status_code == 400 and extra is filter_sets[0]:
+                continue
+            response.raise_for_status()
+            candidates = response.json() or []
+            break
+        for cand in candidates:
+            row_id = cand.get("id")
+            if row_id is None:
+                continue
+            response = self.client.patch(
+                self._queue_url(table),
+                headers=headers,
+                params={
+                    "id": f"eq.{row_id}",
+                    "account_key": f"eq.{account_key}",
+                    "status": "eq.posting",
+                    **extra,
+                },
+                json={"claimed_at": now_dt.isoformat(), "heartbeat_at": now_dt.isoformat()},
+            )
+            if response.status_code == 400:
+                # heartbeat column missing — retry CAS on claimed_at only.
+                response = self.client.patch(
+                    self._queue_url(table),
+                    headers=headers,
+                    params={
+                        "id": f"eq.{row_id}",
+                        "account_key": f"eq.{account_key}",
+                        "status": "eq.posting",
+                        "claimed_at": f"lt.{cutoff}",
+                    },
+                    json={"claimed_at": now_dt.isoformat()},
+                )
+            response.raise_for_status()
+            won = response.json() or []
+            if won:
+                full = self.fetch_queue_row(table, row_id)
+                if full:
+                    rows.append(full)
+        return rows
+
     def mark_post_main_published(
         self, table: str, row_id: int | str, post_id: str
     ) -> None:
+        if _supports_retry_state(table):
+            self._patch_queue_row_with_heartbeat(
+                table, row_id, {"threads_main_post_id": str(post_id)}
+            )
+            return
         self._patch_queue_row(
             table, row_id, {"threads_main_post_id": str(post_id)}
         )
@@ -920,6 +1071,15 @@ class SupabaseStore:
     def mark_post_reply_progress(
         self, table: str, row_id: int | str, reply_ids: list[str]
     ) -> None:
+        if _supports_retry_state(table):
+            # The single most important checkpoint: after EVERY successful
+            # reply publish, the full ordered reply-id list plus a heartbeat
+            # land in one atomic write, so a crash at any later point resumes
+            # from exactly here with zero root/reply duplication.
+            self._patch_queue_row_with_heartbeat(
+                table, row_id, {"threads_reply_ids": list(reply_ids)}
+            )
+            return
         self._patch_queue_row(
             table, row_id, {"threads_reply_ids": list(reply_ids)}
         )
@@ -941,6 +1101,8 @@ class SupabaseStore:
         if _supports_retry_state(table):
             # Success: clear the retry state so the row is terminal and clean.
             payload["next_retry_at"] = None
+            self._patch_queue_row_with_heartbeat(table, row_id, payload)
+            return
         self._patch_queue_row(table, row_id, payload)
 
     def mark_post_failed(

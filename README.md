@@ -62,7 +62,7 @@ threads-operator engagement reject --account <key> --id <engagement-id>
 threads-operator engagement execute --account <key> --id <engagement-id> [--dry-run]
 ```
 
-`publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` for the next tick. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
+`publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` with persisted backoff, and half-published threads are detected via `heartbeat_at` and auto-reclaimed/resumed without human intervention. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
 
 `--account` may be replaced by the operator-wide `THREADS_ACCOUNT` selector, but every account-bound command must resolve exactly one account.
 

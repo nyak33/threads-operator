@@ -159,6 +159,51 @@ class ThreadsAPI:
         response.raise_for_status()
         return response.json()
 
+    def get_reply_shape(self, post_id: str) -> dict[str, Any] | None:
+        """Return {id, is_reply, root_post{id}} for one post, or None if Meta
+        says it does not exist (HTTP 400/404). Used by partial-thread
+        reconciliation to prove a persisted reply id is still live and still
+        belongs to the expected root before resuming a thread from it."""
+        try:
+            response = self.client.get(
+                f"{self.base_url}/{post_id}",
+                params=self._params({"fields": "id,is_reply,root_post"}),
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code in (400, 404):
+                return None
+            raise
+        return response.json() or {}
+
+    def list_direct_replies(self, post_id: str, *, max_pages: int = 10) -> list[dict[str, Any]]:
+        """Direct replies of one post, oldest-first as Meta returns them.
+
+        Uses the official ``GET /{post-id}/replies`` endpoint, paginating up to
+        ``max_pages``. Returns [{id, text}] (text may be None when Meta does
+        not expose it). Raises on hard API errors — callers that treat an
+        unanswerable reconciliation as "unknown" must catch the exception.
+        """
+        out: list[dict[str, Any]] = []
+        after: str | None = None
+        for _ in range(max(1, max_pages)):
+            fields = {"fields": "id,text"}
+            if after:
+                fields["after"] = after
+            response = self.client.get(
+                f"{self.base_url}/{post_id}/replies",
+                params=self._params(fields),
+            )
+            response.raise_for_status()
+            data = response.json() or {}
+            for child in data.get("data") or []:
+                if child.get("id"):
+                    out.append({"id": str(child["id"]), "text": child.get("text")})
+            after = ((data.get("paging") or {}).get("cursors") or {}).get("after")
+            if not after:
+                break
+        return out
+
     def create_text_container(
         self,
         text: str,

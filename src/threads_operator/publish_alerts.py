@@ -99,6 +99,7 @@ def send_publish_alert(
     campaign = result.get("campaign_code")
     scheduled_at = result.get("scheduled_at")
     status = result.get("status", "failed")
+    row: dict[str, Any] | None = None
     try:
         row = store.fetch_queue_row(table, row_id)
         if row:
@@ -112,6 +113,8 @@ def send_publish_alert(
         "max_attempts": "max retry attempts reached",
         "manual_review": "non-retryable content rejection",
         "stalled": "stalled past schedule",
+        "stale_reclaim": "stale posting row reclaimed; resume failed",
+        "duplicate_risk": "duplicate-risk ambiguity — row isolated, not retried",
     }.get(reason, reason)
 
     lines = [
@@ -122,10 +125,19 @@ def send_publish_alert(
         f"• Attempts: `{attempts}`",
         f"• Status: `{status}`",
         f"• Reason: {reason_label}",
-        f"• Last error: {last_error[:600]}",
     ]
+    if row:
+        root_id = row.get("threads_main_post_id") or result.get("main_post_id")
+        done = result.get("reply_ids") or row.get("threads_reply_ids") or []
+        expected = row.get("reply_texts") or []
+        if root_id:
+            lines.append(f"• Root: `{root_id}`")
+        lines.append(f"• Replies: {len(done)}/{len(expected)} completed")
+    lines.append(f"• Last error: {last_error[:600]}")
+    lines.append(
+        "• Action taken: row isolated automatically; other queue rows continue"
+    )
     text = "\n".join(lines)
-
     token = bot_token or _load_env_value("TELEGRAM_BOT_TOKEN")
     chat = chat_id or _load_env_value("TELEGRAM_HOME_CHANNEL") or "79553451"
     if not token:

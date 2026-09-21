@@ -78,6 +78,7 @@ def test_main_only_publish_claims_before_api_and_marks_posted():
         "queue_id": 7,
         "main_post_id": "post-1",
         "reply_ids": [],
+        "resumed": False,
     }
     assert store.calls[0][0] == "claim"
     assert api.calls == [("main post", None)]
