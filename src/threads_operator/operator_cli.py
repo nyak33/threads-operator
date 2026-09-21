@@ -193,6 +193,90 @@ def _parser() -> argparse.ArgumentParser:
     trend_enrich_p.add_argument("--dry-run", action="store_true")
     trend_enrich_p.add_argument("--settle", type=float, default=3.0)
 
+    trendeng = sub.add_parser(
+        "trend-engagement",
+        help="Workflow A: trend candidate -> original own post (approval-gated)",
+    )
+    trendeng_sub = trendeng.add_subparsers(dest="trendeng_command", required=True)
+
+    trendeng_draft = trendeng_sub.add_parser("draft")
+    trendeng_draft.add_argument("--account")
+    trendeng_draft.add_argument("--id", type=int, default=None,
+                                help="one specific candidate id (default: all eligible)")
+    trendeng_draft.add_argument("--limit", type=int, default=5)
+    trendeng_draft.add_argument("--threshold", type=float, default=0.6)
+    trendeng_draft.add_argument("--dry-run", action="store_true")
+
+    trendeng_list = trendeng_sub.add_parser("list")
+    trendeng_list.add_argument("--account")
+    trendeng_list.add_argument("--status", default="pending_approval")
+    trendeng_list.add_argument("--limit", type=int, default=20)
+
+    trendeng_approve = trendeng_sub.add_parser("approve")
+    trendeng_approve.add_argument("--account")
+    trendeng_approve.add_argument("--id", type=int, required=True)
+    trendeng_approve.add_argument("--approval-ref", default=None)
+
+    trendeng_edit = trendeng_sub.add_parser("edit")
+    trendeng_edit.add_argument("--account")
+    trendeng_edit.add_argument("--id", type=int, required=True)
+    trendeng_edit.add_argument("--text", required=True)
+
+    trendeng_reject = trendeng_sub.add_parser("reject")
+    trendeng_reject.add_argument("--account")
+    trendeng_reject.add_argument("--id", type=int, required=True)
+    trendeng_reject.add_argument("--approval-ref", default=None)
+
+    trendeng_skip = trendeng_sub.add_parser("skip")
+    trendeng_skip.add_argument("--account")
+    trendeng_skip.add_argument("--id", type=int, required=True)
+    trendeng_skip.add_argument("--approval-ref", default=None)
+
+    ownreply = sub.add_parser(
+        "own-replies",
+        help="Workflow B: replies under our own posts (approval-gated)",
+    )
+    ownreply_sub = ownreply.add_subparsers(dest="ownreply_command", required=True)
+
+    ownreply_scan = ownreply_sub.add_parser("scan")
+    ownreply_scan.add_argument("--account")
+    ownreply_scan.add_argument("--limit", type=int, default=10,
+                               help="recent own posts to inspect")
+    ownreply_scan.add_argument("--propose", action="store_true",
+                               help="generate drafts and move discovered -> pending_approval")
+    ownreply_scan.add_argument("--dry-run", action="store_true")
+
+    ownreply_list = ownreply_sub.add_parser("list")
+    ownreply_list.add_argument("--account")
+    ownreply_list.add_argument("--status", default=None)
+    ownreply_list.add_argument("--limit", type=int, default=50)
+
+    ownreply_approve = ownreply_sub.add_parser("approve")
+    ownreply_approve.add_argument("--account")
+    ownreply_approve.add_argument("--id", type=int, required=True)
+    ownreply_approve.add_argument("--approval-ref", default=None)
+
+    ownreply_edit = ownreply_sub.add_parser("edit")
+    ownreply_edit.add_argument("--account")
+    ownreply_edit.add_argument("--id", type=int, required=True)
+    ownreply_edit.add_argument("--text", required=True)
+
+    ownreply_reject = ownreply_sub.add_parser("reject")
+    ownreply_reject.add_argument("--account")
+    ownreply_reject.add_argument("--id", type=int, required=True)
+    ownreply_reject.add_argument("--approval-ref", default=None)
+
+    ownreply_ignore = ownreply_sub.add_parser("ignore")
+    ownreply_ignore.add_argument("--account")
+    ownreply_ignore.add_argument("--id", type=int, required=True)
+    ownreply_ignore.add_argument("--approval-ref", default=None)
+
+    ownreply_publish = ownreply_sub.add_parser("publish-approved")
+    ownreply_publish.add_argument("--account")
+    ownreply_publish.add_argument("--id", type=int, default=None,
+                                  help="one specific row id (default: all approved)")
+    ownreply_publish.add_argument("--dry-run", action="store_true")
+
     return parser
 
 
@@ -717,6 +801,435 @@ def _run_trend_enrich(
     }
 
 
+# --------------------------------------------------------------------------
+# Workflow A: trend candidate -> original own post
+# --------------------------------------------------------------------------
+
+def _personas_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "personas"
+
+
+def _run_trendeng_draft(
+    config: AccountConfig,
+    *,
+    candidate_id: int | None,
+    limit: int,
+    threshold: float,
+    dry_run: bool,
+) -> tuple[int, dict[str, Any]]:
+    from . import trend_engagement
+
+    store = _store(config)
+    persona_text = trend_engagement.load_persona(_personas_root(), config.name)
+
+    if candidate_id is not None:
+        row = store.get_trend_candidate(candidate_id)
+        if row is None:
+            return 2, {"ok": False, "account": config.name,
+                       "error": f"candidate {candidate_id} not found for this account"}
+        candidates = [row]
+    else:
+        seen: dict[int, dict[str, Any]] = {}
+        for status in ("discovered", "drafted"):
+            for row in store.list_trend_candidates(limit=min(100, max(limit * 4, 20)), status=status):
+                seen[int(row["id"])] = row
+        candidates = list(seen.values())[:limit]
+
+    drafted: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for candidate in candidates:
+        cid = int(candidate["id"])
+        try:
+            verdict = trend_engagement.score_candidate(
+                candidate,
+                persona_text=persona_text,
+                threshold=threshold,
+            )
+            if not verdict["relevant"]:
+                if not dry_run and candidate.get("status") == "discovered":
+                    store.update_trend_candidate_workflow_a(
+                        candidate_id=cid,
+                        fields={
+                            "status": "skipped",
+                            "trend_score": verdict["score"],
+                            "why_it_works": verdict.get("reason") or "below relevance threshold",
+                        },
+                    )
+                skipped.append({"id": cid, "score": verdict["score"],
+                                "reason": verdict.get("reason")})
+                continue
+            draft = trend_engagement.generate_original_draft(
+                candidate, verdict, persona_text=persona_text
+            )
+            proposal = {
+                "draft_text": draft,
+                "topic": verdict.get("topic"),
+                "reason": verdict.get("reason"),
+                "angle": verdict.get("angle"),
+                "relevance_score": verdict["score"],
+            }
+            if dry_run:
+                drafted.append({"id": cid, "dry_run": True, **proposal})
+                continue
+            fields = trend_engagement.trend_candidate_payload(candidate, verdict, draft)
+            from_status = candidate.get("status") or "discovered"
+            if from_status not in ("discovered", "drafted"):
+                errors.append({"id": cid, "error": f"unexpected status {from_status}"})
+                continue
+            updated = store.transition_trend_candidate(
+                candidate_id=cid,
+                from_status=from_status,
+                to_status="pending_approval",
+                fields={k: v for k, v in fields.items() if k != "status"},
+            )
+            if updated is None:
+                errors.append({"id": cid, "error": "status precondition failed (already moved)"})
+                continue
+            drafted.append({"id": cid, **proposal,
+                            "card": trend_engagement.card_text(updated, proposal)})
+        except Exception as exc:  # noqa: BLE001 - one candidate must not kill the batch
+            errors.append({"id": cid, "error": f"{type(exc).__name__}: {exc}"})
+
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "dry_run": dry_run,
+        "drafted_count": len(drafted),
+        "skipped_count": len(skipped),
+        "error_count": len(errors),
+        "drafted": drafted,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def _run_trendeng_list(
+    config: AccountConfig, *, status: str | None, limit: int
+) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    rows = store.list_trend_candidates(limit=limit, status=status or None)
+    out = []
+    for row in rows:
+        wa = (row.get("raw_metadata") or {}).get("workflow_a") or {}
+        out.append({
+            "id": row.get("id"),
+            "status": row.get("status"),
+            "source_username": row.get("source_username"),
+            "source_permalink": row.get("source_permalink"),
+            "topic": row.get("topic"),
+            "trend_score": row.get("trend_score"),
+            "draft_text": wa.get("draft_text"),
+            "reason": wa.get("reason"),
+            "used_in_queue_id": row.get("used_in_queue_id"),
+        })
+    return 0, {"ok": True, "account": config.name, "count": len(out), "candidates": out}
+
+
+def _trendeng_set_status(
+    config: AccountConfig,
+    *,
+    candidate_id: int,
+    from_status: str,
+    to_status: str,
+) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    row = store.transition_trend_candidate(
+        candidate_id=candidate_id, from_status=from_status, to_status=to_status
+    )
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate {candidate_id} is not {from_status} (or not this account)"}
+    return 0, {"ok": True, "account": config.name, "id": candidate_id, "status": to_status}
+
+
+def _run_trendeng_approve(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Approve -> enqueue through the EXISTING publish queue. Idempotent."""
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate {candidate_id} not found for this account"}
+    if candidate.get("used_in_queue_id"):
+        return 0, {
+            "ok": True, "account": config.name, "id": candidate_id,
+            "status": candidate.get("status"),
+            "queue_id": candidate.get("used_in_queue_id"),
+            "already_queued": True,
+        }
+    if candidate.get("status") != "pending_approval":
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate is {candidate.get('status')}, not pending_approval"}
+
+    wa = (candidate.get("raw_metadata") or {}).get("workflow_a") or {}
+    draft = (wa.get("draft_text") or "").strip()
+    if not draft:
+        return 2, {"ok": False, "account": config.name,
+                   "error": "no draft text on candidate — redraft before approval"}
+    topic = (candidate.get("topic") or wa.get("topic") or "").strip() or None
+
+    # CAS pending_approval -> approved first so a double-approval races here
+    # instead of double-enqueueing.
+    moved = store.transition_trend_candidate(
+        candidate_id=candidate_id, from_status="pending_approval", to_status="approved"
+    )
+    if moved is None:
+        current = store.get_trend_candidate(candidate_id) or {}
+        return 0, {
+            "ok": True, "account": config.name, "id": candidate_id,
+            "status": current.get("status"),
+            "queue_id": current.get("used_in_queue_id"),
+            "already_queued": bool(current.get("used_in_queue_id")),
+        }
+
+    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+    campaign = config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
+    queue_row = store.enqueue_draft(
+        table, draft, reply_texts=[], campaign_code=campaign, topic=topic
+    )
+    finished = store.update_trend_candidate_workflow_a(
+        candidate_id=candidate_id,
+        fields={"status": "queued", "used_in_queue_id": int(queue_row["id"])},
+    )
+    return 0, {
+        "ok": True, "account": config.name, "id": candidate_id,
+        "status": (finished or {}).get("status", "queued"),
+        "queue_id": queue_row.get("id"), "topic": topic,
+    }
+
+
+def _run_trendeng_edit(
+    config: AccountConfig, *, candidate_id: int, text: str
+) -> tuple[int, dict[str, Any]]:
+    if len(text) > 500:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"edited draft is {len(text)} chars (limit 500)"}
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None or candidate.get("status") != "pending_approval":
+        return 2, {"ok": False, "account": config.name,
+                   "error": "candidate is not pending_approval (or not this account)"}
+    raw = dict(candidate.get("raw_metadata") or {})
+    wa = dict(raw.get("workflow_a") or {})
+    wa["draft_text"] = text
+    wa["edited"] = True
+    raw["workflow_a"] = wa
+    updated = store.update_trend_candidate_workflow_a(
+        candidate_id=candidate_id, fields={"raw_metadata": raw}
+    )
+    return 0, {"ok": True, "account": config.name, "id": candidate_id,
+               "updated": updated is not None, "draft_text": text}
+
+
+# --------------------------------------------------------------------------
+# Workflow B: replies under our own posts
+# --------------------------------------------------------------------------
+
+def _run_ownreply_scan(
+    config: AccountConfig, *, limit: int, propose: bool, dry_run: bool
+) -> tuple[int, dict[str, Any]]:
+    from . import own_replies, trend_engagement
+
+    api = _api(config)
+    store = _store(config)
+
+    posts = api.list_posts()[: max(1, min(limit, 50))]
+    if dry_run:
+        discovered_preview: list[dict[str, Any]] = []
+        for post in posts:
+            try:
+                children = api.list_direct_replies(str(post.get("id") or ""))
+            except Exception:
+                continue
+            for child in children:
+                discovered_preview.append({
+                    "reply_id": child.get("id"),
+                    "parent_post_id": post.get("id"),
+                    "from_username": child.get("username"),
+                    "reply_text": (child.get("text") or "")[:120],
+                })
+        return 0, {"ok": True, "account": config.name, "dry_run": True,
+                   "posts_scanned": len(posts), "replies_seen": len(discovered_preview),
+                   "replies": discovered_preview[:50]}
+
+    me = None
+    try:
+        me = api.get_authenticated_identity()
+    except Exception:
+        pass
+    own_username = (me or {}).get("username") or ""
+
+    new_rows = own_replies.discover_new_replies(
+        api=api, store=store, recent_posts=posts, own_username=own_username
+    )
+
+    proposed: list[dict[str, Any]] = []
+    if propose and new_rows:
+        persona_text = trend_engagement.load_persona(_personas_root(), config.name)
+        for row in new_rows:
+            try:
+                draft = own_replies.generate_reply_draft(
+                    persona_text=persona_text,
+                    parent_post_text=row.get("parent_post_text"),
+                    from_username=row.get("from_username"),
+                    reply_text=row.get("reply_text"),
+                )
+                moved = store.transition_own_reply(
+                    row_id=int(row["id"]),
+                    from_status="discovered",
+                    to_status="pending_approval",
+                    fields={"proposed_text": draft},
+                )
+                if moved is not None:
+                    proposed.append({"id": moved["id"], "reply_id": moved["reply_id"],
+                                     "draft": draft,
+                                     "card": own_replies.card_text(moved)})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("draft generation failed for row %s: %s", row.get("id"), exc)
+
+    return 0, {
+        "ok": True, "account": config.name,
+        "posts_scanned": len(posts),
+        "new_replies": len(new_rows),
+        "proposed": proposed,
+        "proposed_count": len(proposed),
+    }
+
+
+def _run_ownreply_list(
+    config: AccountConfig, *, status: str | None, limit: int
+) -> tuple[int, dict[str, Any]]:
+    rows = _store(config).list_own_replies(status=status or None, limit=limit)
+    return 0, {"ok": True, "account": config.name, "count": len(rows), "replies": rows}
+
+
+def _run_ownreply_decision(
+    config: AccountConfig, *, row_id: int, decision: str
+) -> tuple[int, dict[str, Any]]:
+    """approve / reject / ignore — all require the row be in an open state."""
+    store = _store(config)
+    if decision == "approve":
+        moved = store.transition_own_reply(
+            row_id=row_id, from_status=("discovered", "pending_approval"),
+            to_status="approved",
+            fields={"approved_at": store._utc_now()},
+        )
+    elif decision == "reject":
+        moved = store.transition_own_reply(
+            row_id=row_id, from_status=("discovered", "pending_approval"),
+            to_status="rejected",
+            fields={"rejected_at": store._utc_now()},
+        )
+    else:  # ignore
+        moved = store.transition_own_reply(
+            row_id=row_id, from_status=("discovered", "pending_approval"),
+            to_status="ignored",
+            fields={"ignored_at": store._utc_now()},
+        )
+    if moved is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"row {row_id} is not in an open state (or not this account)"}
+    return 0, {"ok": True, "account": config.name, "id": row_id, "status": decision}
+
+
+def _run_ownreply_edit(
+    config: AccountConfig, *, row_id: int, text: str
+) -> tuple[int, dict[str, Any]]:
+    if len(text) > 500:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"edited reply is {len(text)} chars (limit 500)"}
+    store = _store(config)
+    moved = store.transition_own_reply(
+        row_id=row_id, from_status="pending_approval", to_status="pending_approval",
+        fields={"proposed_text": text},
+    )
+    if moved is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"row {row_id} is not pending_approval (or not this account)"}
+    return 0, {"ok": True, "account": config.name, "id": row_id, "proposed_text": text}
+
+
+def _run_ownreply_publish(
+    config: AccountConfig, *, row_id: int | None, dry_run: bool
+) -> tuple[int, dict[str, Any]]:
+    """Publish approved replies via the official Graph API. Claim-first CAS
+    prevents double-publishes; transient errors return the row to approved,
+    permanent errors burn it to failed with the exact API error recorded."""
+    from . import own_replies
+
+    store = _store(config)
+    if row_id is not None:
+        row = store.get_own_reply(row_id)
+        targets = [row] if row and row.get("status") == "approved" else []
+    else:
+        targets = store.list_own_replies(status="approved", limit=50)
+
+    if dry_run:
+        return 0, {"ok": True, "account": config.name, "dry_run": True,
+                   "eligible": len(targets),
+                   "ids": [t.get("id") for t in targets]}
+    if not config.get_bool("THREADS_ENGAGEMENT_ENABLED"):
+        return 3, {"ok": False, "account": config.name,
+                   "error": "Live engagement is disabled; require THREADS_ENGAGEMENT_ENABLED=true"}
+
+    api = _api(config)
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        tid = int(target["id"])
+        claimed = store.transition_own_reply(
+            row_id=tid, from_status="approved", to_status="posting",
+            fields={"claimed_at": store._utc_now(),
+                    "attempt_count": int(target.get("attempt_count") or 0) + 1},
+        )
+        if claimed is None:
+            results.append({"id": tid, "status": "skipped",
+                            "reason": "already claimed by another worker"})
+            continue
+        try:
+            published_id = api.publish_text(
+                str(claimed.get("proposed_text") or ""),
+                reply_to_id=str(claimed.get("reply_id") or ""),
+            )
+            posted = store.transition_own_reply(
+                row_id=tid, from_status="posting", to_status="posted",
+                fields={"external_action_id": published_id,
+                        "executed_at": store._utc_now()},
+            )
+            results.append({"id": tid, "status": "posted",
+                            "published_reply_id": published_id,
+                            "row": posted})
+        except Exception as exc:  # noqa: BLE001
+            error = redact_error(f"{type(exc).__name__}: {exc}", _known_secrets(config))
+            attempts = int(claimed.get("attempt_count") or 1)
+            if own_replies.is_transient_error(error) and attempts < own_replies.MAX_REPLY_ATTEMPTS:
+                store.transition_own_reply(
+                    row_id=tid, from_status="posting", to_status="approved",
+                    fields={"last_error": error},
+                )
+                results.append({"id": tid, "status": "approved",
+                                "retry_scheduled": True, "error": error})
+            else:
+                store.transition_own_reply(
+                    row_id=tid, from_status="posting", to_status="failed",
+                    fields={"last_error": error, "executed_at": store._utc_now()},
+                )
+                results.append({"id": tid, "status": "failed", "error": error,
+                                "permanent": not own_replies.is_transient_error(error)})
+
+    posted_n = sum(1 for r in results if r.get("status") == "posted")
+    failed_n = sum(1 for r in results if r.get("status") == "failed")
+    return (0 if failed_n == 0 else 1), {
+        "ok": failed_n == 0,
+        "account": config.name,
+        "processed": len(results),
+        "posted": posted_n,
+        "failed": failed_n,
+        "results": results,
+    }
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -816,6 +1329,62 @@ def main(
                 url=args.url,
                 dry_run=args.dry_run,
                 settle=args.settle,
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "draft":
+            code, payload = _run_trendeng_draft(
+                config,
+                candidate_id=args.id,
+                limit=args.limit,
+                threshold=args.threshold,
+                dry_run=args.dry_run,
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "list":
+            code, payload = _run_trendeng_list(
+                config, status=args.status, limit=args.limit
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "approve":
+            code, payload = _run_trendeng_approve(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "edit":
+            code, payload = _run_trendeng_edit(
+                config, candidate_id=args.id, text=args.text
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "reject":
+            code, payload = _trendeng_set_status(
+                config, candidate_id=args.id,
+                from_status="pending_approval", to_status="rejected",
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "skip":
+            code, payload = _trendeng_set_status(
+                config, candidate_id=args.id,
+                from_status="pending_approval", to_status="skipped",
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "scan":
+            code, payload = _run_ownreply_scan(
+                config, limit=args.limit, propose=args.propose, dry_run=args.dry_run
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "list":
+            code, payload = _run_ownreply_list(
+                config, status=args.status, limit=args.limit
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "approve":
+            code, payload = _run_ownreply_decision(
+                config, row_id=args.id, decision="approve"
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "edit":
+            code, payload = _run_ownreply_edit(
+                config, row_id=args.id, text=args.text
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "reject":
+            code, payload = _run_ownreply_decision(
+                config, row_id=args.id, decision="reject"
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "ignore":
+            code, payload = _run_ownreply_decision(
+                config, row_id=args.id, decision="ignore"
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "publish-approved":
+            code, payload = _run_ownreply_publish(
+                config, row_id=args.id, dry_run=args.dry_run
             )
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")

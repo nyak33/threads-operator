@@ -78,6 +78,8 @@ For a fresh database, apply the repository migrations in filename order that are
 
 For an existing deployment, apply any not-yet-applied forward migrations. Do not drop production tables just to reach the latest schema.
 
+The two engagement workflows (trend→own-post drafting and own-post reply handling) require `migrations/010_two_engagement_workflows.sql`. It widens the `threads_trend_candidates` status CHECK (adding `drafted`, `pending_approval`, `queued`, `skipped`, `posted`, `failed`) and creates `threads_own_reply_engagement`. Until it is applied, `trend-engagement draft/approve` and all `own-replies` writes fail against the live schema (the code fails closed — no partial writes). See [`docs/two-engagement-workflows.md`](docs/two-engagement-workflows.md) for the full architecture, Telegram cards, and watchdog schedules.
+
 ### Existing single-account Activity database
 
 If the older single-account `003_activity_follow_events.sql` was already applied, run `005_activity_multi_account_upgrade.sql` before enabling the new Activity writer. It preserves the table instead of dropping historical data.

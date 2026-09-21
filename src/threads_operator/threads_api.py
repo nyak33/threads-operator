@@ -92,6 +92,16 @@ class ThreadsAPI:
             )
         return posts
 
+    def get_authenticated_identity(self) -> dict[str, Any]:
+        """Fetch {id, username} for the token's own account (GET /me)."""
+        response = self.client.get(
+            f"{self.base_url}/me",
+            params=self._params({"fields": "id,username"}),
+        )
+        response.raise_for_status()
+        data = response.json() or {}
+        return {"id": data.get("id"), "username": data.get("username")}
+
     def get_post_identity(self, post_id: str) -> dict[str, Any]:
         """Fetch {id, permalink, username} for ONE post by its numeric id.
 
@@ -187,7 +197,7 @@ class ThreadsAPI:
         out: list[dict[str, Any]] = []
         after: str | None = None
         for _ in range(max(1, max_pages)):
-            fields = {"fields": "id,text"}
+            fields = {"fields": "id,text,username,timestamp,permalink"}
             if after:
                 fields["after"] = after
             response = self.client.get(
@@ -198,7 +208,15 @@ class ThreadsAPI:
             data = response.json() or {}
             for child in data.get("data") or []:
                 if child.get("id"):
-                    out.append({"id": str(child["id"]), "text": child.get("text")})
+                    out.append(
+                        {
+                            "id": str(child["id"]),
+                            "text": child.get("text"),
+                            "username": child.get("username"),
+                            "timestamp": child.get("timestamp"),
+                            "permalink": child.get("permalink"),
+                        }
+                    )
             after = ((data.get("paging") or {}).get("cursors") or {}).get("after")
             if not after:
                 break

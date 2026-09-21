@@ -76,7 +76,23 @@ TREND_CANDIDATES_TABLE = "threads_trend_candidates"
 
 # Statuses that exist in the live schema check — do not invent new ones.
 TREND_STATUSES = frozenset(
-    {"discovered", "reviewed", "approved", "rejected", "used", "stale"}
+    {
+        # Legacy v1 statuses (kept valid so historical rows keep parsing).
+        "discovered",
+        "reviewed",
+        "approved",
+        "rejected",
+        "used",
+        "stale",
+        # Workflow A lifecycle (migration 010): trend candidate -> original
+        # own post, approval-gated, enqueued through the normal publisher.
+        "drafted",
+        "pending_approval",
+        "queued",
+        "skipped",
+        "posted",
+        "failed",
+    }
 )
 
 # Explicit SELECT column allowlist: evidence fields only. Analysis fields
@@ -744,6 +760,322 @@ class SupabaseStore:
         rows = response.json() or []
         for row in rows:
             if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    # ------------------------------------------------- Workflow A: trend drafts
+
+    def update_trend_candidate_workflow_a(
+        self,
+        *,
+        candidate_id: int,
+        fields: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Account-scoped UPDATE for the Workflow A approval lifecycle.
+
+        Dedicated to status/draft transitions (drafted, pending_approval,
+        approved, queued, rejected, skipped, posted, failed) plus the draft
+        payload carried in raw_metadata.workflow_a. Unlike the evidence
+        method, this path IS allowed to set status/topic/trend_score/
+        adaptation_angle/why_it_works/used_in_queue_id — and nothing else.
+        WHERE is always ``id == candidate_id AND target_account_id ==
+        self.account_key``.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        if not isinstance(fields, dict) or not fields:
+            raise ValueError("fields must be a non-empty dict")
+
+        allowed = {
+            "status",
+            "topic",
+            "trend_score",
+            "adaptation_angle",
+            "why_it_works",
+            "used_in_queue_id",
+            "raw_metadata",
+        }
+        body: dict[str, Any] = {}
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"workflow_a field {key!r} is not in the allowlist")
+            if key == "status":
+                if value not in TREND_STATUSES:
+                    raise ValueError(f"invalid trend status {value!r}")
+                body[key] = value
+            elif key == "raw_metadata":
+                if not isinstance(value, dict):
+                    raise ValueError("raw_metadata must be an object")
+                body[key] = value
+            elif key == "used_in_queue_id":
+                if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, int)
+                ):
+                    raise ValueError("used_in_queue_id must be an integer or None")
+                body[key] = value
+            elif key == "trend_score":
+                body[key] = None if value is None else float(value)
+            else:
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"{key} must be a string or None")
+                body[key] = value
+
+        # raw_metadata merges over the existing object (read account-scoped
+        # first) so a draft write cannot clobber provenance.
+        if "raw_metadata" in body:
+            existing = self.get_trend_candidate(candidate_id)
+            if existing is None:
+                return None
+            current_raw = existing.get("raw_metadata")
+            if current_raw is not None and not isinstance(current_raw, dict):
+                raise ValueError(
+                    "existing raw_metadata is not an object — refusing to overwrite"
+                )
+            body["raw_metadata"] = {**(current_raw or {}), **body["raw_metadata"]}
+
+        body["updated_at"] = self._utc_now()
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    def transition_trend_candidate(
+        self,
+        *,
+        candidate_id: int,
+        from_status: str,
+        to_status: str,
+        fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS status transition — only fires when the row is still in
+        ``from_status``. Returns the updated row, or None when the
+        precondition no longer holds (another worker already moved it)."""
+        account_key = self._require_account_key()
+        if to_status not in TREND_STATUSES:
+            raise ValueError(f"invalid trend status {to_status!r}")
+        body: dict[str, Any] = {"status": to_status, "updated_at": self._utc_now()}
+        for key, value in (fields or {}).items():
+            if key == "status":
+                continue
+            body[key] = value
+        if "raw_metadata" in body:
+            existing = self.get_trend_candidate(candidate_id)
+            if existing is None:
+                return None
+            current_raw = existing.get("raw_metadata")
+            if current_raw is not None and not isinstance(current_raw, dict):
+                raise ValueError(
+                    "existing raw_metadata is not an object — refusing to overwrite"
+                )
+            body["raw_metadata"] = {**(current_raw or {}), **body["raw_metadata"]}
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+                "status": f"eq.{from_status}",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    # --------------------------------------- Workflow B: own-post reply states
+
+    OWN_REPLY_TABLE = "threads_own_reply_engagement"
+    OWN_REPLY_STATUSES = frozenset(
+        {
+            "discovered",
+            "pending_approval",
+            "approved",
+            "rejected",
+            "ignored",
+            "posting",
+            "posted",
+            "failed",
+        }
+    )
+
+    def upsert_own_reply(self, *, reply: dict[str, Any]) -> dict[str, Any]:
+        """Insert a discovered inbound reply, deduped by (account, reply_id).
+
+        A reply that already exists returns the existing row unchanged —
+        discovery is idempotent no matter how many watchdog ticks observe
+        the same inbound reply. Only unhandled rows resurface.
+        """
+        account_key = self._require_account_key()
+        reply_id = reply.get("reply_id")
+        if not isinstance(reply_id, str) or not reply_id.strip():
+            raise ValueError("reply_id must be a non-blank string")
+        existing = self.get_own_reply_by_reply_id(reply_id.strip())
+        if existing is not None:
+            return existing
+
+        parent_post_id = reply.get("parent_post_id")
+        if not isinstance(parent_post_id, str) or not parent_post_id.strip():
+            raise ValueError("parent_post_id must be a non-blank string")
+        payload: dict[str, Any] = {
+            "account_key": account_key,
+            "reply_id": reply_id.strip(),
+            "parent_post_id": parent_post_id.strip(),
+            "status": "discovered",
+        }
+        for key in (
+            "parent_post_permalink",
+            "parent_post_text",
+            "from_username",
+            "reply_text",
+            "reply_permalink",
+            "replied_at",
+        ):
+            value = reply.get(key)
+            if value is not None:
+                if not isinstance(value, str):
+                    raise ValueError(f"{key} must be a string or None")
+                payload[key] = value
+
+        headers = {**self._headers, "Prefer": "return=representation"}
+        response = self.client.post(
+            f"{self.base_url}/rest/v1/{self.OWN_REPLY_TABLE}",
+            headers=headers,
+            json=payload,
+        )
+        if response.status_code == 409:
+            raced = self.get_own_reply_by_reply_id(reply_id.strip())
+            if raced is not None:
+                return raced
+        response.raise_for_status()
+        rows = response.json() or []
+        if not rows:
+            raise ValueError("own-reply insert did not return a row")
+        return rows[0]
+
+    def get_own_reply_by_reply_id(self, reply_id: str) -> dict[str, Any] | None:
+        account_key = self._require_account_key()
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.OWN_REPLY_TABLE}",
+            headers=self._headers,
+            params={
+                "select": "*",
+                "account_key": f"eq.{account_key}",
+                "reply_id": f"eq.{reply_id}",
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        for row in response.json() or []:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
+
+    def get_own_reply(self, row_id: int) -> dict[str, Any] | None:
+        account_key = self._require_account_key()
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.OWN_REPLY_TABLE}",
+            headers=self._headers,
+            params={
+                "select": "*",
+                "id": f"eq.{row_id}",
+                "account_key": f"eq.{account_key}",
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        for row in response.json() or []:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
+
+    def list_own_replies(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        account_key = self._require_account_key()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("limit must be an integer between 1 and 200")
+        if status is not None and status not in self.OWN_REPLY_STATUSES:
+            raise ValueError(
+                "status must be one of: " + ", ".join(sorted(self.OWN_REPLY_STATUSES))
+            )
+        params: dict[str, Any] = {
+            "select": "*",
+            "account_key": f"eq.{account_key}",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        }
+        if status:
+            params["status"] = f"eq.{status}"
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.OWN_REPLY_TABLE}",
+            headers=self._headers,
+            params=params,
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
+
+    def transition_own_reply(
+        self,
+        *,
+        row_id: int,
+        from_status: str | tuple[str, ...],
+        to_status: str,
+        fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS transition on a Workflow B row. ``from_status`` may be a tuple
+        for transitions legal from several states (e.g. reject from
+        discovered OR pending_approval). None = precondition failed."""
+        account_key = self._require_account_key()
+        if to_status not in self.OWN_REPLY_STATUSES:
+            raise ValueError(f"invalid own-reply status {to_status!r}")
+        body: dict[str, Any] = {"status": to_status, "updated_at": self._utc_now()}
+        for key, value in (fields or {}).items():
+            if key in {"id", "account_key", "reply_id", "status"}:
+                continue
+            body[key] = value
+        from_list = (
+            [from_status] if isinstance(from_status, str) else list(from_status)
+        )
+        for state in from_list:
+            if state not in self.OWN_REPLY_STATUSES:
+                raise ValueError(f"invalid from_status {state!r}")
+        params: dict[str, Any] = {
+            "id": f"eq.{row_id}",
+            "account_key": f"eq.{account_key}",
+        }
+        if len(from_list) == 1:
+            params["status"] = f"eq.{from_list[0]}"
+        else:
+            params["status"] = "in.(" + ",".join(from_list) + ")"
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{self.OWN_REPLY_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params=params,
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
                 return row
         return None
 

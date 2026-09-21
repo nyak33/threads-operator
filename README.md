@@ -60,11 +60,26 @@ threads-operator engagement approve --account <key> --id <engagement-id>
 threads-operator engagement edit --account <key> --id <engagement-id> --text <replacement>
 threads-operator engagement reject --account <key> --id <engagement-id>
 threads-operator engagement execute --account <key> --id <engagement-id> [--dry-run]
+threads-operator trend-engagement draft --account <key> [--limit <n>] [--threshold <f>] [--dry-run]
+threads-operator trend-engagement list --account <key> [--status <status>]
+threads-operator trend-engagement approve --account <key> --id <candidate-id>
+threads-operator trend-engagement edit --account <key> --id <candidate-id> --text <draft>
+threads-operator trend-engagement reject --account <key> --id <candidate-id>
+threads-operator trend-engagement skip --account <key> --id <candidate-id>
+threads-operator own-replies scan --account <key> [--limit <n>] [--propose] [--dry-run]
+threads-operator own-replies list --account <key> [--status <status>]
+threads-operator own-replies approve --account <key> --id <row-id>
+threads-operator own-replies edit --account <key> --id <row-id> --text <reply>
+threads-operator own-replies reject --account <key> --id <row-id>
+threads-operator own-replies ignore --account <key> --id <row-id>
+threads-operator own-replies publish-approved --account <key> [--id <row-id>] [--dry-run]
 ```
 
 `publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` with persisted backoff, and half-published threads are detected via `heartbeat_at` and auto-reclaimed/resumed without human intervention. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
 
 `--account` may be replaced by the operator-wide `THREADS_ACCOUNT` selector, but every account-bound command must resolve exactly one account.
+
+`trend-engagement` (Workflow A) drafts ORIGINAL posts from trend candidates and, only after Telegram approval, enqueues them through the normal publish queue. `own-replies` (Workflow B) discovers replies under the account's own posts via the Graph API and publishes persona-drafted responses only after Telegram approval. Both are fully approval-gated; see [`docs/two-engagement-workflows.md`](docs/two-engagement-workflows.md). Requires migration `010_two_engagement_workflows.sql`.
 
 ## Account Configuration
 

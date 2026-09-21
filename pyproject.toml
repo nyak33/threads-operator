@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "threads-operator"
 version = "0.2.0"
 requires-python = ">=3.11"
-dependencies = ["httpx>=0.27,<1", "websockets>=12,<17"]
+dependencies = ["httpx>=0.27,<1", "websockets>=12,<17", "PyYAML>=6,<7"]
 
 [project.scripts]
 threads-operator = "threads_operator.operator_cli:main"
