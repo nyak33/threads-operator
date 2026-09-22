@@ -138,13 +138,14 @@ class _BaseWorkflowDispatcher:
         account: str,
         send: SendFn,
         edit_message: EditFn | None = None,
+        edit: EditFn | None = None,
         cli_argv: list[str] | None = None,
         cwd: str | None = None,
         edit_store: PendingEditStore | None = None,
     ) -> None:
         self.account = account
         self._send = send
-        self._edit = edit_message
+        self._edit = edit or edit_message
         self.cli_argv = cli_argv or list(DEFAULT_CLI)
         self.cwd = cwd
         if edit_store is None:
@@ -252,14 +253,6 @@ class TrendEngagementDispatcher(_BaseWorkflowDispatcher):
     actions = TRENDENG_ACTIONS
     edit_prompt = "Send the new draft text for this trend post, or 'cancel'."
 
-    async def _decide(
-        self, row_id: int, action: str, *, chat_id: str, message_id: str | None, answer: AnswerFn | None
-    ) -> None:
-        await super()._decide(row_id, action, chat_id=chat_id, message_id=message_id, answer=answer)
-        if action == "approve":
-            # Surface the queue id when the CLI returned one.
-            pass
-
 
 class OwnReplyDispatcher(_BaseWorkflowDispatcher):
     """Workflow B: ownreply: callbacks -> own-replies CLI group."""
@@ -268,3 +261,12 @@ class OwnReplyDispatcher(_BaseWorkflowDispatcher):
     prefix = OWNREPLY_PREFIX
     actions = OWNREPLY_ACTIONS
     edit_prompt = "Send the new reply text, or 'cancel'."
+
+
+# Aliases used by the Hermes Telegram gateway adapter (do not remove).
+class TrendEngagementTelegramBridge(TrendEngagementDispatcher):
+    """Gateway-compatible alias for Workflow A."""
+
+
+class OwnReplyTelegramBridge(OwnReplyDispatcher):
+    """Gateway-compatible alias for Workflow B."""

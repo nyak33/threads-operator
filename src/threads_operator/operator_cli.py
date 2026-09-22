@@ -1061,6 +1061,25 @@ def _run_ownreply_scan(
         pass
     own_username = (me or {}).get("username") or ""
 
+    if not propose:
+        # No drafting, no DB writes: just report current state.
+        discovered_preview: list[dict[str, Any]] = []
+        for post in posts:
+            try:
+                children = api.list_direct_replies(str(post.get("id") or ""))
+            except Exception:
+                continue
+            for child in children:
+                discovered_preview.append({
+                    "reply_id": child.get("id"),
+                    "parent_post_id": post.get("id"),
+                    "from_username": child.get("username"),
+                    "reply_text": (child.get("text") or "")[:120],
+                })
+        return 0, {"ok": True, "account": config.name, "propose": False,
+                   "posts_scanned": len(posts), "replies_seen": len(discovered_preview),
+                   "replies": discovered_preview[:50]}
+
     new_rows = own_replies.discover_new_replies(
         api=api, store=store, recent_posts=posts, own_username=own_username
     )
