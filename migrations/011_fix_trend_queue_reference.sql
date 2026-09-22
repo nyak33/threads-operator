@@ -43,9 +43,23 @@ update public.threads_trend_candidates
  where used_in_queue_id is not null;
 
 -- Align the column with threads_publish_queue.id (bigint).
+-- Guard: this workflow had not gone live; abort if any real references exist.
+do $$
+declare
+    non_null_count integer;
+begin
+    select count(*) into non_null_count
+    from public.threads_trend_candidates
+    where used_in_queue_id is not null;
+
+    if non_null_count > 0 then
+        raise exception 'threads_trend_candidates.used_in_queue_id contains % non-null value(s); manual cleanup required before altering type', non_null_count;
+    end if;
+end $$;
+
 alter table public.threads_trend_candidates
     alter column used_in_queue_id type bigint
-    using (used_in_queue_id::bigint);
+    using (null::bigint);
 
 -- Add the correct foreign key to the publish queue.
 alter table public.threads_trend_candidates
