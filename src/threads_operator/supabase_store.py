@@ -115,6 +115,8 @@ TREND_EVIDENCE_COLUMNS = (
     "reposts",
     "quotes",
     "status",
+    "topic",
+    "used_in_queue_id",
     "raw_metadata",
 )
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
