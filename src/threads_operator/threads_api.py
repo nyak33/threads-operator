@@ -374,6 +374,12 @@ def _is_non_retryable_publish_error(response: httpx.Response) -> bool:
     error_type = str(error.get("type", "")).lower()
     message = str(error.get("message", "")).lower()
     code = error.get("code")
+    subcode = error.get("error_subcode")
+    # Meta reports the documented/observed container-propagation race as an
+    # OAuthException even though it is not an authentication failure. Let the
+    # publish retry path handle this exact media-not-found condition.
+    if code == 24 and subcode == 4279009:
+        return False
     if (
         response.status_code == 429
         or code in {4, 17, 32, 613}
@@ -428,10 +434,16 @@ def _is_transient_publish_error(response: httpx.Response) -> bool:
     if not isinstance(error, dict):
         return True
     error_type = str(error.get("type", "")).lower()
-    if "oauth" in error_type:
-        return False
     message = str(error.get("message", "")).lower()
     code = error.get("code")
+    subcode = error.get("error_subcode")
+    # 24/4279009 is Meta's "media/container not found yet" propagation race.
+    # It is labelled OAuthException in the payload, so special-case it before
+    # the real OAuth rejection guard below.
+    if code == 24 and subcode == 4279009:
+        return True
+    if "oauth" in error_type:
+        return False
     # A rate/limit rejection is not helped by immediate in-call retries — the
     # worker's scheduled requeue to the next tick handles the backoff instead.
     if (
