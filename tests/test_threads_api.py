@@ -185,3 +185,39 @@ def test_oauth_400_is_not_silently_treated_as_missing_metrics():
     api = ThreadsAPI("token", "user-123", client=make_client(handler))
     with pytest.raises(httpx.HTTPStatusError):
         api.get_post_insights("post-1")
+
+
+def test_publish_text_retries_meta_media_not_found_race():
+    calls = {"create": 0, "publish": 0}
+
+    def handler(request):
+        if request.url.path == "/v1.0/user-123/threads":
+            calls["create"] += 1
+            return httpx.Response(200, json={"id": "container-1"})
+        if request.url.path == "/v1.0/user-123/threads_publish":
+            calls["publish"] += 1
+            if calls["publish"] == 1:
+                return httpx.Response(
+                    400,
+                    json={
+                        "error": {
+                            "message": "The requested resource does not exist",
+                            "type": "OAuthException",
+                            "code": 24,
+                            "error_subcode": 4279009,
+                        }
+                    },
+                )
+            return httpx.Response(200, json={"id": "post-1"})
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    post_id = api.publish_text(
+        "hello",
+        max_attempts=2,
+        retry_delay_seconds=0,
+        container_retries=0,
+    )
+
+    assert post_id == "post-1"
+    assert calls == {"create": 1, "publish": 2}
