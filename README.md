@@ -78,8 +78,7 @@ All items below are verified against code and the running VPS (see `docs/fresh-i
 **Current implementation limitations** (not yet built):
 - Runtime-job installation is idempotent but the *initial* job creation for a brand-new account still runs `scripts/install_jobs.sh` manually (no auto-registration on `add_account.sh`).
 - Browser-session bootstrap for Activity collection is a manual login step per account (no automated credential entry — by design; the operator never automates passwords/CAPTCHA/2FA).
-- The Supabase migration set has not yet been replayed against a brand-new empty project in an automated test (see `docs/fresh-install-verification.md`, "NOT EXERCISED").
-- One production-only manual step remains: `migrations/002_post_daily_rollups.sql` must be applied in the Supabase SQL editor (it is additive and safe).
+- The full Supabase migration chain has been replayed against a brand-new empty project (externally verified 2026-09-23 — all apply + idempotency re-run pass). It surfaced a fresh-install RLS gap, fixed by `migrations/014_fresh_schema_security_reconcile.sql` (apply LAST on a fresh project to reproduce production's RLS/service_role-only posture; production already has this posture so 014 is posture-preserving there).
 
 ## How It Works
 
@@ -122,7 +121,7 @@ cd threads-operator
 ./scripts/install_jobs.sh --account <account-key>
 ```
 
-**Supabase:** create a project, then apply migrations in the SQL editor. Order: `013_missing_base_tables_reconcile.sql` FIRST on a fresh project (it recreates the base tables the early migrations assume), then `001`, `001b`, `002`, `003`–`012` in filename order. `006_security_hardening.sql` tightens privileges. Never apply migrations destructively to production; 002/013 are additive.
+**Supabase:** create a project, then apply migrations in the SQL editor. Order on a fresh project: `013_missing_base_tables_reconcile.sql` FIRST (it recreates the base tables the early migrations assume), then `001`, `001b`, `002`, `003`–`012` in filename order, then `014_fresh_schema_security_reconcile.sql` LAST (reconciles fresh-install RLS/privilege posture with production: RLS on, anon/authenticated locked out, service_role-only). `006_security_hardening.sql` tightens privileges. Never apply migrations destructively to production; 002/013/014 are additive.
 
 ## Configuration
 

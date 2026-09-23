@@ -35,14 +35,16 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 - `scripts/doctor.sh`: single PASS/WARN/FAIL diagnostic (Python, package, account config, live Supabase connectivity + 12-table schema probe, Telegram, Hermes env/cron, runtime dirs). Verified live (11 pass / 1 warn / 0 fail) and in clean room (correct FAIL modes).
 - `scripts/install_jobs.sh` + `config/runtime-jobs.json` + `config/trend-discovery-prompt.md.tmpl`: declarative, idempotent runtime-job install/converge/remove for the 7 Hermes cron jobs; dry-run and status modes; verified against the live store (7/7 present).
 - Clean-room verification (`docs/fresh-install-verification.md`): fresh clone bootstraps, CLI works, 557 tests pass, no `/home/admin` in code paths. Two real defects found and fixed: missing exec bits on bootstrap/add_account/publish-queue-worker, and a doctor.sh false-PASS on Supabase probe errors.
-- Test suite: 557 passed, 1 skipped (baseline 542 + 15 new contract tests; no test weakened).
+- External fresh-Supabase replay (2026-09-23): all 14 migrations applied + idempotency re-run passed; `002` confirmed applied to production. It surfaced a fresh-install RLS/privilege gap — fixed by `migrations/014_fresh_schema_security_reconcile.sql` (enable RLS + revoke anon/authenticated + grant service_role + idempotent policy on the 7 operator tables), regression-guarded by `tests/test_migration_014_security_reconcile.py`.
+- Test suite: 565 passed, 1 skipped (baseline 542 + 15 contract tests + 8 migration-014 security regression tests; no test weakened).
 
 ## Deployment Next
 
-1. Apply `migrations/002_post_daily_rollups.sql` to production Supabase (safe, additive — the table is absent and `scripts/rebuild_rollups.py` fails until then).
-2. Reconcile/retire old remote branches per `docs/repo-reconciliation.md` classifications (user sign-off required before deletion).
-3. Fresh-VPS end-to-end run including a throwaway Supabase project replay of all migrations (only remaining plug-and-play gap).
-4. Multi-account hardening soak (per-account failure isolation under simultaneous operation).
+1. ~~Apply `migrations/002_post_daily_rollups.sql` to production Supabase~~ — DONE (externally verified 2026-09-23; table exists, RLS on, PK/indexes present; `rebuild_rollups.py` blocker cleared).
+2. Apply `migrations/014_fresh_schema_security_reconcile.sql` to production Supabase (safe, additive, idempotent — production already has RLS on these tables, so this is posture-preserving and only adds the service_role policy where absent). Also re-replay the full chain incl. 014 on the throwaway project to confirm the Security Advisor ERROR clears.
+3. Reconcile/retire old remote branches per `docs/repo-reconciliation.md` classifications (user sign-off required before deletion).
+4. Fresh-VPS end-to-end run including a throwaway Supabase project replay of all migrations incl. 014 (remaining plug-and-play gap — fresh replay done; 014 re-replay pending).
+5. Multi-account hardening soak (per-account failure isolation under simultaneous operation).
 
 ## Deliberately Later / Non-Goals
 
