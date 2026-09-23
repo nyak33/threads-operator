@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "description": "Threads Operator Hermes runtime jobs. Installed/updated/removed by scripts/install_jobs.sh. Schedules and delivery targets mirror the verified live jobs (captured 2026-09-23).",
+  "jobs": [
+    {
+      "name": "Threads Insights Collector",
+      "kind": "script",
+      "script": "scripts/threads_insights_collect.sh",
+      "schedule": {"kind": "interval", "minutes": 5},
+      "deliver": "telegram",
+      "account_scoped": false,
+      "purpose": "Collect per-post + account insights snapshots into Supabase every 5 minutes. Silent on success; Telegram alert after 3 failed attempts."
+    },
+    {
+      "name": "Threads Activity Follow Collector",
+      "kind": "script",
+      "script": "scripts/threads_activity_collect.sh",
+      "schedule": {"kind": "cron", "expr": "*/15 * * * *"},
+      "deliver": "local",
+      "account_scoped": true,
+      "purpose": "Read-only browser collector: detect new followers/follow-backs from Threads Activity, write follow events to Supabase."
+    },
+    {
+      "name": "Threads Stale-Claim Watchdog",
+      "kind": "script",
+      "script": "scripts/threads_stale_claim_watchdog.py",
+      "schedule": {"kind": "cron", "expr": "*/15 * * * *"},
+      "deliver": "origin",
+      "account_scoped": true,
+      "purpose": "Recover publish-queue rows stuck in a claimed/processing state (worker crash or timeout) so they are retried instead of wedged."
+    },
+    {
+      "name": "Threads Trend Engagement Watchdog ({{ACCOUNT}})",
+      "kind": "script",
+      "script": "scripts/trend_engagement_watchdog_30m.py",
+      "schedule": {"kind": "cron", "expr": "*/30 * * * *"},
+      "deliver": "local",
+      "account_scoped": true,
+      "purpose": "Every 30m: check execute-approved trend replies for publishing success; draft replies for newly approved trend candidates and send Telegram approval cards."
+    },
+    {
+      "name": "Threads Own-Replies Watchdog ({{ACCOUNT}})",
+      "kind": "script",
+      "script": "scripts/own_replies_watchdog_5m.py",
+      "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+      "deliver": "local",
+      "account_scoped": true,
+      "purpose": "Every 5m: publish execute-approved own-post replies; poll new inbound replies on own posts; draft replies for approval-pending ones and send Telegram approval cards."
+    },
+    {
+      "name": "Threads Trend Approval Timeout Watchdog ({{ACCOUNT}})",
+      "kind": "script",
+      "script": "scripts/trend_engagement_timeout_1h.py",
+      "schedule": {"kind": "cron", "expr": "0 * * * *"},
+      "deliver": "local",
+      "account_scoped": true,
+      "purpose": "Hourly: reject own/trend candidates pending too long without a decision; send the operator a timeout summary."
+    },
+    {
+      "name": "Threads Trend Discovery ({{ACCOUNT}})",
+      "kind": "prompt",
+      "prompt_template": "config/trend-discovery-prompt.md.tmpl",
+      "schedule": {"kind": "cron", "expr": "0 8-23/3 * * *"},
+      "deliver": "origin",
+      "account_scoped": true,
+      "purpose": "Agent-based: search public Threads for strong Malaysian-audience trend candidates, ingest via CLI (trend add --external), read-only enrich, alert only on new inserts."
+    }
+  ]
+}
