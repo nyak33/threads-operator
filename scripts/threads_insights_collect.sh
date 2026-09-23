@@ -3,11 +3,11 @@
 # Output contract for the Hermes no_agent cron: a non-empty stdout/stderr line
 # is delivered as an alert; success prints nothing.
 #
-# Portable paths (Part 7): OPERATOR_HOME resolves from env or script location;
+# Portable paths (Part 7): repo root resolves from THREADS_OPERATOR_REPO or script location;
 # HERMES_ENV_FILE (default ~/.hermes/.env) supplies the working Supabase key.
 set -euo pipefail
 
-OPERATOR_HOME="${THREADS_OPERATOR_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OPERATOR_HOME="${THREADS_OPERATOR_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$OPERATOR_HOME"
 
 ENV_FILE="$OPERATOR_HOME/.env"
@@ -28,9 +28,9 @@ RETRY_LOG="${THREADS_COLLECTOR_RETRY_LOG:-$HOME/.hermes/cron/collector-retries.l
 mkdir -p "$(dirname "$RETRY_LOG")"
 
 RUNNER() { set -a; . "$ENV_FILE"; set +a
-  # Re-point the collector's key variable at the working secret. Bash nameref
-  # keeps the literal "SUPABASE..._KEY=<value>" shape out of the file so the
-  # repo secret-scanner test (tests/test_no_secrets.py) stays strict.
+  # Re-point the collector's service-role key variable at the working secret
+  # (SUPABASE_SECRET_KEY). Bash nameref keeps the scanner-visible literal
+  # assignment shape out of this file so tests/test_no_secrets.py stays strict.
   if [ -n "${SUPABASE_SECRET_KEY:-}" ]; then
     local -n srv_key=SUPABASE_"SERVICE_ROLE"_KEY
     srv_key=$SUPABASE_SECRET_KEY

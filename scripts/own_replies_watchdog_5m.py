@@ -21,7 +21,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-REPO = os.environ.get("THREADS_OPERATOR_HOME", str(Path(__file__).resolve().parent.parent))
+REPO = os.environ.get("THREADS_OPERATOR_REPO", str(Path(__file__).resolve().parent.parent))
 CLI = [".venv/bin/threads-operator", "own-replies"]
 ACCOUNT = os.environ.get("THREADS_ACCOUNT", "syaqir")
 

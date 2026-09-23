@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Allow running from repo or from Hermes scripts dir
-_REPO = os.environ.get("THREADS_OPERATOR_HOME", str(Path(__file__).resolve().parent.parent))
+_REPO = os.environ.get("THREADS_OPERATOR_REPO", str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(_REPO) / "src"))
 
 from threads_operator.account_config import load_account_config

@@ -11,7 +11,7 @@ if ! flock -n 9; then
   exit 0
 fi
 
-OPERATOR_HOME="${THREADS_OPERATOR_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OPERATOR_HOME="${THREADS_OPERATOR_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ACCOUNT="${THREADS_ACCOUNT:-syaqir}"
 ACCOUNT_ENV="${THREADS_ACCOUNT_ENV:-${HOME}/.threads-operator/accounts/${ACCOUNT}.env}"
 
