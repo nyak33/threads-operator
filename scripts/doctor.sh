@@ -114,14 +114,15 @@ PY
     else
       fail "Supabase probe errors: $ERRORS_T"
     fi
-    if [ -n "$MISSING_T" ]; then
+    # only claim schema completeness when every table probed cleanly
+    if [ -z "$ERRORS_T" ] && [ -z "$MISSING_T" ]; then
+      pass "all 12 expected tables present"
+    elif [ -n "$MISSING_T" ]; then
       if echo "$MISSING_T" | grep -q "threads_post_daily_rollups"; then
         warn "missing tables: $MISSING_T (threads_post_daily_rollups needs migrations/002_post_daily_rollups.sql — known pending step)"
       else
         fail "missing tables: $MISSING_T — apply migrations (013 reconciles production-only tables)"
       fi
-    else
-      pass "all 12 expected tables present"
     fi
   fi
 fi
