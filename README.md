@@ -1,278 +1,188 @@
 # Threads Operator
 
-Portable deterministic helpers for operating one or many Threads accounts from a single VPS/Hermes installation.
+Deterministic runtime for operating one or more Threads accounts from a single VPS + Hermes installation. It owns account selection, official Threads API publishing, approval-gated engagement, trend-candidate intake, historical Insights collection, and read-only Activity/Follows collection — with Supabase as the source of truth and Telegram as the operator interface. Real credentials and browser sessions never enter Git.
 
-The repository owns account selection, official Threads API calls, historical Insights collection, read-only Activity/Follows collection, account-scoped Supabase state and approved-queue publishing. Real credentials and browser sessions stay outside GitHub.
+## What It Does
 
-## Architecture
+The operating model is: **content enters a Supabase queue → a scheduler/executor publishes approved, due rows via the official Threads API → inbound replies and trend candidates are drafted for a human → Telegram approve/edit/reject → executed replies and engagement metrics flow back into Supabase.**
 
 ```text
-one VPS / one Hermes / one threads-operator install
-                       |
-          +------------+------------+
-          |                         |
-      account A                   account B
-  API token + user ID         API token + user ID
-  browser profile            browser profile
-  Supabase config            Supabase config
-          |                         |
-          +---- shared codebase ----+
+ content (external / Hermes-generated draft)
+        |  status=draft -> approved (human or upstream flow)
+        v
+ +-------------------+      official Threads API      +-----------+
+ | Supabase queues   |  ---------------------------->  |  Threads  |
+ | (source of truth) | <----------------------------   |   API     |
+ +-------------------+   post IDs, insights, replies   +-----------+
+        ^    |                                              |
+        |    v                                              |
+ | publish-worker / watchdogs (Hermes cron)                 |
+        |    |                                              |
+        |    +-- trend discovery (Hermes agent, read-only) -+
+        |    +-- own-replies watchdog (draft -> Telegram approval)
+        |    +-- trend-engagement watchdog (draft -> Telegram approval)
+        v
+ Telegram operator: approve / edit / reject / timeout
 ```
 
-Each account is selected explicitly. The operator never guesses which account should run and does not silently inherit another account's exported Threads/Supabase secrets.
+Only flows that exist today are shown. LLM content generation itself is **not** part of this repo: Threads Operator receives already-generated text (or ingests trend permalinks) and handles everything deterministic around it.
 
-## Fresh VPS Quick Start
+## Current Capabilities
+
+All items below are verified against code and the running VPS (see `docs/fresh-install-verification.md` and the test suite, 557 passed / 1 skipped).
+
+### Content Management
+- Account-scoped publish queue (`threads_publish_queue`, default; overridable per account).
+- Draft ingress via `enqueue-draft` — never auto-promotes; human/upstream approval moves rows to `approved`.
+- Per-row **topic** → published as Meta `topic_tag` on the root post (1 topic/post, normalized to Meta rules); survives retries/requeues.
+- Main post + optional follow-up replies in one queue row; the main post ID is persisted before replies are attempted.
+
+### Publishing
+- Scheduled publishing: only `status=approved` rows due by `scheduled_at` are claimed, with a conditional claim (lost claim never publishes).
+- `publish-worker` cron variant: automatic requeue of transient failures (network, 429, 5xx, non-OAuth 400) back to `approved` with persisted backoff; OAuth/permission errors stay visibly `failed`.
+- Half-published thread recovery via `heartbeat_at` — auto-reclaim/resume without human intervention.
+- Live posting is opt-in per account: requires `THREADS_POSTING_ENABLED=true` **and** `THREADS_EXECUTION_MODE=auto_post`.
+
+### Engagement
+- **Workflow A — trend-engagement**: trend candidate → original own post, approval-gated, enqueued through the normal publish queue.
+- **Workflow B — own-replies**: discovers replies under the account's own posts via the Graph API, drafts persona-voiced responses, publishes only after Telegram approval.
+- Both are fully approval-gated (`pending_approval -> approved -> executing -> posted`, plus `rejected`); editing keeps a reply pending; a separate kill-switch `THREADS_ENGAGEMENT_ENABLED=true` gates live execution.
+- Watchdogs draft replies, send Telegram approval cards, publish execute-approved replies, and time out stale approvals.
+
+### Trend Discovery
+- Hermes-side discovery (agent cron job) searches public Threads, ingests **only** via `trend add --external` (records `candidate_role=external_trend`, `discovery_method=hermes_external`, `discovered_by=hermes`), dedupes by permalink, and alerts only on new inserts.
+- Read-only factual enrichment (`trend enrich`) captures observed post facts through the account's browser profile; provenance is verifiable via `trend show`.
+
+### Analytics / Insights
+- Append-only historical account + post snapshots (views, likes, replies, reposts, quotes, shares), post-age-aware sampling, raw `NULL` preserved for unavailable metrics (never fabricated zeroes), daily rollups.
+
+### Multi-Account
+- Account config, personas, browser profiles, and queue scoping are per-account and isolated; one shared codebase/install.
+- Verified today: strict account-file contract (`~/.threads-operator/accounts/<key>.env`), account-scoped Activity persistence, per-account persona fail-closed resolution, account-scoped publish queue and engagement/trend tables.
+- Production currently runs one account (`syaqir`). Multi-account hardening (per-account failure isolation guarantees, simultaneous-operation soak) is roadmap, not current.
+
+### Telegram / Operator Interface
+- Approval cards for drafted replies (own-replies + trend-engagement), approve/edit/reject/execute flows, publish alerts, trend-discovery alerts, and watchdog failure alerts.
+- Alert chat resolves from `TELEGRAM_HOME_CHANNEL` / `TELEGRAM_CHAT_ID` in the Hermes env file; when unconfigured, alerts no-op instead of leaking to a hardcoded chat.
+
+### Automation
+- 7 Hermes cron jobs declared in `config/runtime-jobs.json` (6 script jobs + 1 agent trend-discovery job): insights collector, activity-follow collector, stale-claim watchdog, trend-engagement watchdog, own-replies watchdog, trend approval-timeout watchdog, trend discovery. Install/verify/remove via `scripts/install_jobs.sh`.
+
+## Known Limitations
+
+**Platform limitations** (Threads/Meta prevents these):
+- Replies to arbitrary third-party posts are not generally available via the API; engagement is limited to own-post replies and approved original posts. (`GET /{web_id}` for external roots returns error subcode 33; keyword search is own-posts-only on this app's permissions.)
+- `Followed from your post` per-post attribution is not exposed as an official Insights metric — the read-only Activity collector approximates it with explicit confidence levels instead.
+- Rate limits, token expiry/permissions, and API instability are Meta-side; the operator handles them with retries/backoff but cannot eliminate them.
+
+**Current implementation limitations** (not yet built):
+- Runtime-job installation is idempotent but the *initial* job creation for a brand-new account still runs `scripts/install_jobs.sh` manually (no auto-registration on `add_account.sh`).
+- Browser-session bootstrap for Activity collection is a manual login step per account (no automated credential entry — by design; the operator never automates passwords/CAPTCHA/2FA).
+- The full Supabase migration chain has been replayed against a brand-new empty project (externally verified 2026-09-23 — all apply + idempotency re-run pass). It surfaced a fresh-install RLS gap, fixed by `migrations/014_fresh_schema_security_reconcile.sql` (apply LAST on a fresh project to reproduce production's RLS/service_role-only posture; production already has this posture so 014 is posture-preserving there).
+
+## How It Works
+
+Components and responsibilities:
+
+- **Supabase** — source of truth: publish queue, trend candidates, engagement queue, insights snapshots/rollups, activity events, gateway keys. All state transitions are SQL-conditional.
+- **Threads API (official Graph)** — publishing, own-post reply discovery, insights metrics.
+- **`threads_operator` Python package** (`src/`) — account config resolution, API adapters, publisher/publish-worker, engagement/own-replies/trend workflows, insights + activity collectors, Telegram alert/callback senders. Deterministic; no LLM calls.
+- **Hermes** — the scheduler and the only LLM brain: cron jobs run repo scripts (watchdogs/collectors) or the trend-discovery agent prompt; Hermes' configured model generates reply text inside those flows.
+- **Telegram** — operator interface for approvals and alerts.
+- **Runtime jobs** — declared in `config/runtime-jobs.json`, installed into Hermes cron by `scripts/install_jobs.sh`.
+- **Browser profile** (optional, per account) — persistent Chromium profile for read-only Activity/trend enrichment.
+
+## Requirements
+
+**Runtime:**
+- Linux VPS, Python 3.11+, bash.
+- Hermes (scheduler + Telegram gateway + the model used inside engagement/trend flows).
+- Supabase project (PostgREST reachable; service-role key).
+- Threads/Meta app credentials (access token + user ID) per account.
+- Telegram bot token + chat id (in the Hermes env file).
+- Optional: Chromium (for Activity collection / trend enrichment browser profile).
+
+**Development / optional (NOT runtime requirements):**
+- pytest, pip-audit (CI/dev only).
+- Graphify, Diagram Design, Superpowers — documentation/planning tools used during this repo's hardening; the operator does not need them to run.
+
+## Installation
+
+**Current: semi-automated.** Bootstrap, account scaffolding, doctor, tests, and runtime-job install are scripted and clean-room verified. Supabase project creation, credential entry, browser login, and one SQL migration are manual. **Target: plug-and-play** — not claimed until a fresh-VPS end-to-end run (including a throwaway Supabase project) passes.
 
 ```bash
 git clone https://github.com/nyak33/threads-operator.git
 cd threads-operator
-bash scripts/bootstrap.sh
-bash scripts/add_account.sh syaqir
+./scripts/bootstrap.sh                 # venv + package + operator home
+./scripts/add_account.sh <account-key> # creates ~/.threads-operator/accounts/<key>.env (600)
+# edit the account file with real credentials
+# apply Supabase migrations (see below)
+./scripts/doctor.sh --account <account-key>
+./scripts/install_jobs.sh --account <account-key>
 ```
 
-Fill the local account file created at `~/.threads-operator/accounts/syaqir.env`, then validate it:
+**Supabase:** create a project, then apply migrations in the SQL editor. Order on a fresh project: `013_missing_base_tables_reconcile.sql` FIRST (it recreates the base tables the early migrations assume), then `001`, `001b`, `002`, `003`–`012` in filename order, then `014_fresh_schema_security_reconcile.sql` LAST (reconciles fresh-install RLS/privilege posture with production: RLS on, anon/authenticated locked out, service_role-only). `006_security_hardening.sql` tightens privileges. Never apply migrations destructively to production; 002/013/014 are additive.
 
-```bash
-.venv/bin/threads-operator doctor --account syaqir
-```
+## Configuration
 
-Add more accounts by repeating `add_account.sh` with another account key. One installation is shared; credentials, browser profiles and datastore settings remain separate.
+| Category | Where | Required | Keys (values never in git) |
+|---|---|---|---|
+| Account | `~/.threads-operator/accounts/<key>.env` (600) | REQUIRED | `THREADS_ACCESS_TOKEN`, `THREADS_USER_ID`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
+| Account behavior | same file | OPTIONAL (defaults exist) | `THREADS_POSTING_ENABLED=false`, `THREADS_EXECUTION_MODE=approval_required`, `THREADS_QUEUE_TABLE=threads_publish_queue`, `THREADS_ACCOUNT_SAMPLE_MINUTES=15`, `ACTIVITY_FOLLOW_COLLECTOR_ENABLED=false`, `THREADS_BROWSER_PROFILE`, `THREADS_ENGAGEMENT_ENABLED`, `THREADS_QUEUE_CAMPAIGN_CODE` |
+| Telegram | `~/.hermes/.env` | REQUIRED for alerts | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_HOME_CHANNEL` (or `TELEGRAM_CHAT_ID`) |
+| Persona | `personas/<key>.md` (in repo, no secrets) | REQUIRED for voiced generation | public style rules only |
+| Schedules | `config/runtime-jobs.json` | GENERATED into Hermes cron | per-job schedule/deliver |
 
-See [`RUNBOOK.md`](RUNBOOK.md) for deployment, migration, browser-session, scheduling and failure-handling instructions. See [`GOAL.md`](GOAL.md) for system boundaries and [`PROGRESS.md`](PROGRESS.md) for current implementation status.
+Classification: **REQUIRED** values must be real (not `replace_me`) before doctor passes; **OPTIONAL** values have safe defaults; **GENERATED** artifacts are produced by scripts, not hand-edited. Template: `accounts/example.env`.
 
-## Commands
+## Operations
 
-```text
-threads-operator accounts list
-threads-operator doctor --account <key>
-threads-operator insights --account <key>
-threads-operator activity-follow --account <key> --dry-run
-threads-operator enqueue-draft --account <key> --text <text>
-threads-operator publish --account <key> --dry-run
-threads-operator publish-worker --account <key> [--campaign-code <code>] [--dry-run]
-threads-operator trend add --account <key> --url <threads-url> [--external] [--dry-run]
-threads-operator trend list --account <key> [--status <status>]
-threads-operator trend show --account <key> --id <candidate-id>
-threads-operator trend enrich --account <key> --id <candidate-id>
-threads-operator engagement propose-reply --account <key> --source-post-id <id> --url <url> --text <reply>
-threads-operator engagement list --account <key> --status pending_approval
-threads-operator engagement approve --account <key> --id <engagement-id>
-threads-operator engagement edit --account <key> --id <engagement-id> --text <replacement>
-threads-operator engagement reject --account <key> --id <engagement-id>
-threads-operator engagement execute --account <key> --id <engagement-id> [--dry-run]
-threads-operator trend-engagement draft --account <key> [--limit <n>] [--threshold <f>] [--dry-run]
-threads-operator trend-engagement list --account <key> [--status <status>]
-threads-operator trend-engagement approve --account <key> --id <candidate-id>
-threads-operator trend-engagement edit --account <key> --id <candidate-id> --text <draft>
-threads-operator trend-engagement reject --account <key> --id <candidate-id>
-threads-operator trend-engagement skip --account <key> --id <candidate-id>
-threads-operator own-replies scan --account <key> [--limit <n>] [--propose] [--dry-run]
-threads-operator own-replies list --account <key> [--status <status>]
-threads-operator own-replies approve --account <key> --id <row-id>
-threads-operator own-replies edit --account <key> --id <row-id> --text <reply>
-threads-operator own-replies reject --account <key> --id <row-id>
-threads-operator own-replies ignore --account <key> --id <row-id>
-threads-operator own-replies publish-approved --account <key> [--id <row-id>] [--dry-run]
-```
+- **Validate an account:** `./scripts/doctor.sh --account <key>` (PASS/WARN/FAIL; exit 1 on any FAIL)
+- **Tests:** `.venv/bin/python -m pytest -q`
+- **Runtime jobs:** `./scripts/install_jobs.sh --status` / `--account <key>` / `--remove --account <key>`
+- **Add an account:** `./scripts/add_account.sh <key>` → fill credentials → doctor
+- **Update code:** `git pull`, re-run `./scripts/bootstrap.sh`, re-run tests; runtime jobs converge via `install_jobs.sh`
+- **Recovery/rollback, browser sessions, failure handling, migration details:** [`RUNBOOK.md`](RUNBOOK.md)
 
-`publish` publishes one approved due row (single-shot). `publish-worker` is the cron-friendly variant: identical publishing, but transient failures are automatically requeued to `approved` with persisted backoff, and half-published threads are detected via `heartbeat_at` and auto-reclaimed/resumed without human intervention. See [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md).
+## Current Features
 
-`--account` may be replaced by the operator-wide `THREADS_ACCOUNT` selector, but every account-bound command must resolve exactly one account.
+Everything under "Current Capabilities" above — verified in code and on the running VPS. Nothing is listed here on the strength of a branch or a TODO.
 
-`trend-engagement` (Workflow A) drafts ORIGINAL posts from trend candidates and, only after Telegram approval, enqueues them through the normal publish queue. `own-replies` (Workflow B) discovers replies under the account's own posts via the Graph API and publishes persona-drafted responses only after Telegram approval. Both are fully approval-gated; see [`docs/two-engagement-workflows.md`](docs/two-engagement-workflows.md). Requires migration `010_two_engagement_workflows.sql`.
+## Roadmap
 
-## Account Configuration
+### Near Term — Plug-and-Play Hardening (in progress on `feat/plug-and-play-hardening`)
+- Complete repo reconciliation of all VPS-only runtime code (done: watchdogs, collectors, rollups, alerts).
+- Reproducible migrations: replay the full set against a throwaway Supabase project.
+- Bootstrap/doctor/runtime-job installer (done: `doctor.sh`, `install_jobs.sh`, `runtime-jobs.json`).
+- Clean-room install testing (done for code path; Supabase replay pending).
+- Multi-account hardening (failure-isolation soak, simultaneous-operation guarantees).
+- Auto-register runtime jobs on `add_account.sh`.
 
-Use [`accounts/example.env`](accounts/example.env) as the safe template. New deployments store real account files outside the repository at:
+### Next — Operator Reliability
+- Stronger queue/retry recovery, health monitoring, better failure alerts, automatic recovery, observability.
 
-```text
-~/.threads-operator/accounts/<account-key>.env
-```
+### Later — Intelligence / Optimization
+- Content performance feedback loop, insights-driven content generation, richer trend selection, account-level optimization, automated experimentation.
 
-Each account can use the same Supabase project or a different one. Account-local mutable rows such as Activity observations and publish-queue work are scoped by `account_key` when a database is shared.
+### Future / Optional
+- Selective-repost executor (API adapter already exposes the repost endpoint), additional platform support.
 
-LLM provider credentials do **not** belong in Threads Operator account files. If Hermes is configured to generate content, its model/API credentials stay in Hermes' own global/runtime configuration. Threads Operator receives only the already-generated text. See [`docs/hermes-content-generation.md`](docs/hermes-content-generation.md).
+## Repository Docs
 
-## Account Personas
-
-Public voice/style is account-scoped in versioned Markdown files:
-
-```text
-personas/<account-key>.md
-```
-
-For example, account `syaqir` uses [`personas/syaqir.md`](personas/syaqir.md). Another Threads account should have its own file, such as `personas/brand_a.md`.
-
-Before Hermes generates a reply or other account-voiced text, it must load the persona matching the selected `--account`. Persona resolution is fail-closed: if `personas/<account-key>.md` is missing, Hermes must stop generation and report the missing persona instead of borrowing another account's voice.
-
-Persona files are model-independent. They contain public style/content rules only; Hermes uses whatever provider/model is currently configured as its primary/default model. Do not put provider names, API keys, Threads credentials, Supabase credentials or unnecessary private information in persona files.
-
-See [`personas/README.md`](personas/README.md) for the persona contract.
-
-## Historical Insights
-
-The Insights subsystem preserves historical account/post snapshots so growth and velocity can be calculated later rather than relying only on live lifetime totals.
-
-It stores:
-
-- account snapshots including supported follower/view/engagement totals;
-- post snapshots including views, likes, replies, reposts, quotes and shares;
-- post age at capture time;
-- raw `NULL` for unavailable metrics rather than fabricated zeroes.
-
-Raw snapshots are append-only. Partial metric responses remain valid. Historical all-`NULL` rows do not make a post appear fresh.
-
-Recommended post sampling remains age-aware:
-
-| Post age | Minimum interval |
-|---|---:|
-| 0–2h | 5m |
-| 2–6h | 15m |
-| 6–24h | 30m |
-| 1–3d | 60m |
-| 3–7d | 6h |
-| >7d | 24h |
-
-Account snapshots default to every 15 minutes.
-
-## Activity / Follows Attribution
-
-The optional Activity collector reads the authenticated Threads Activity/Follows page because `Followed from your post` information is not exposed as the same per-post official Insights metric.
-
-Each account uses its own persistent Chromium profile. The collector is deliberately read-only: it does not click, type, like, reply, follow, message, replay private requests or bypass authentication challenges.
-
-The Activity UI exposes source text/snippets rather than a guaranteed source-post ID. Matching therefore retains explicit high/medium/low/unknown confidence instead of presenting inferred attribution as exact fact.
-
-The detailed design and limitations remain in [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md).
-
-## External Trend Discovery
-
-Trend discovery remains a Hermes responsibility; Threads Operator owns deterministic validation, account scoping, storage and factual enrichment.
-
-Manual URLs use the default ingress:
-
-```bash
-.venv/bin/threads-operator trend add --account syaqir --url "$THREADS_URL"
-```
-
-When Hermes itself discovers an external post, it must use the explicit external flag:
-
-```bash
-.venv/bin/threads-operator trend add \
-  --account syaqir \
-  --url "$THREADS_URL" \
-  --external
-```
-
-That records `candidate_role=external_trend`, `discovery_method=hermes_external` and `discovered_by=hermes` without confusing automated discovery with a manual URL. If the insert returns a new candidate id, Hermes may run `trend enrich --id <id>` to capture observed post facts through the existing read-only browser profile. Existing permalinks remain deduplicated.
-
-See [`docs/hermes-trend-discovery.md`](docs/hermes-trend-discovery.md) for the scheduled discovery flow.
-
-
-## Approval-Gated Engagement
-
-Hermes may generate short micro-replies for relevant external posts, but it cannot approve its own reply. Before generation, Hermes must load the selected account's exact `personas/<account-key>.md` file. Proposed replies are inserted into `threads_engagement_queue` as `pending_approval` and surfaced to Telebot.
-
-The allowed reply state flow is:
-
-```text
-pending_approval -> approved -> executing -> posted
-                 -> rejected
-```
-
-Editing a reply keeps it in `pending_approval`. Live execution is separately disabled by default and requires:
-
-```text
-THREADS_ENGAGEMENT_ENABLED=true
-```
-
-Even with that flag enabled, `engagement execute` conditionally claims only an already-`approved` row. The approval transition records the Telebot channel/reference for auditability. Duplicate actions are prevented per account + source permalink + action.
-
-Reply publishing uses the official Threads reply mechanism through `reply_to_id`. The API adapter also exposes the official repost endpoint for the later selective-repost executor. Browser-driven likes remain outside this approval queue module.
-
-See [`docs/hermes-engagement-approval.md`](docs/hermes-engagement-approval.md) for the Telebot workflow and safety boundary.
-
-## Optional Hermes-Generated Drafts
-
-The default workflow remains external/ChatGPT-created content entering Supabase before Threads Operator executes it.
-
-Optionally, Hermes can use its own configured LLM/provider to generate content and submit the result as an account-scoped draft:
-
-```bash
-.venv/bin/threads-operator enqueue-draft \
-  --account syaqir \
-  --text "$GENERATED_TEXT" \
-  --campaign-code HERMES_GENERATED
-```
-
-This command never calls an LLM, never approves content and never publishes. It inserts `status=draft` into the selected account's configured queue. Model choice and LLM API keys remain entirely outside Threads Operator.
-
-## Approved-Queue Publishing
-
-The generic Supabase queue is `threads_publish_queue`. Eligible work is account-scoped, `approved`, and due by `scheduled_at`. A worker conditionally claims the row before any Threads publish call.
-
-Live publishing is disabled by default. It requires both:
-
-```text
-THREADS_POSTING_ENABLED=true
-THREADS_EXECUTION_MODE=auto_post
-```
-
-A dry run may inspect eligible work without claiming or publishing it.
-
-The publisher persists the main Threads post ID before attempting optional replies. If a later step fails, the queue retains known IDs and moves to a visible failed state for reconciliation instead of blindly retrying the whole chain.
-
-## Content Topics
-
-Every content row should carry a meaningful, content-specific topic. At publish time the topic is attached to the **root post** as Meta's `topic_tag` (one topic per post; replies do not carry one). Rows without a topic publish exactly as before — a missing topic never crashes publishing.
-
-Supported queue field mappings (resolved centrally in `src/threads_operator/topic.py`):
-
-- `threads_publish_queue.topic` → Meta `topic_tag`
-- `threads_content_queue.topic_tag` → Meta `topic_tag`
-- `note_to_self_queue.topic_tag` → Meta `topic_tag`
-- `affiliate_queue.topic` → Meta `topic_tag`
-- `hadith_content_queue.topic` → Meta `topic_tag`
-
-How it flows: the queue's topic column is read from the claimed row, normalized to Meta's `topic_tag` rules (1–50 chars, no `. & @ ! ? , ; : #`), and passed on the create-container request in `threads_api.py`. Because the topic lives on the row itself, it survives normal publish, retries, requeues, recovery resumes, and delayed scheduling untouched — the row is never stripped of it.
-
-Rules for content generators (Hermes or any external brain):
-
-1. Assign a specific, meaningful topic per row (e.g. "Local SEO", "Career Upskilling", "Digital Marketing", "Hadith & Reflection"). Do not fall back to a generic "General" when a real topic is determinable.
-2. The topic must be account/content specific — never hardcode one topic globally across an account's whole output.
-3. `enqueue-draft --topic "..."` records the topic at draft creation; prefer setting it there over relying on any DB fallback.
-
-## Database Migrations
-
-For a fresh full deployment, apply the relevant migrations in filename order:
-
-- `001_threads_insights.sql`
-- `001b_threads_insights_snapshots.sql`
-- `003_activity_follow_events.sql` for Activity
-- `004_threads_publish_queue.sql` for publishing
-- `005_activity_multi_account_upgrade.sql` where relevant for upgraded Activity data
-- `006_security_hardening.sql` to tighten operator table privileges
-- `007_threads_engagement_queue.sql` for approval-gated external engagement actions
-
-Existing deployments that already applied the original single-account Activity migration must use the multi-account upgrade migration described in the runbook rather than dropping historical data.
+- [`RUNBOOK.md`](RUNBOOK.md) — operations, deployment, migrations, browser sessions, failure handling.
+- [`GOAL.md`](GOAL.md) — system boundaries and intended end state.
+- [`PROGRESS.md`](PROGRESS.md) — implementation status.
+- [`docs/repo-reconciliation.md`](docs/repo-reconciliation.md) — Part 1–7 audit: branches, VPS-vs-repo artifacts, Supabase schema reconciliation.
+- [`docs/fresh-install-verification.md`](docs/fresh-install-verification.md) — Part 22 clean-room results.
+- [`docs/superpowers-pilot.md`](docs/superpowers-pilot.md) — Superpowers pilot task record.
+- [`docs/two-engagement-workflows.md`](docs/two-engagement-workflows.md), [`docs/hermes-engagement-approval.md`](docs/hermes-engagement-approval.md), [`docs/hermes-trend-discovery.md`](docs/hermes-trend-discovery.md), [`docs/hermes-content-generation.md`](docs/hermes-content-generation.md), [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md), [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md) — subsystem designs.
 
 ## Safety
 
-- no real credentials, browser profiles or cookies belong in Git;
-- no LLM provider credentials belong in Threads Operator or its account ENV files;
-- account selection is explicit;
-- Threads API credentials are restricted to the official HTTPS API host;
-- Activity collection is read-only;
-- missing Insights metrics remain unknown/null;
-- generated content enters the queue as `draft` only;
-- live posting is opt-in per account;
-- live engagement has a separate opt-in kill-switch;
-- Hermes-generated replies require an explicit human approval transition before execution;
-- account-voiced generation must use the exact matching persona file and never silently fall back to another account's persona;
-- a lost queue claim never publishes;
-- OAuth/permission failures are not treated as transient readiness failures;
-- the operator does not automate passwords, CAPTCHA or 2FA bypass;
-- no LLM provider or content-generation logic is required by the deterministic runtime.
+- No real credentials, browser profiles, or cookies in git; no LLM provider credentials in this repo or account env files.
+- Account selection is explicit; a lost queue claim never publishes; OAuth/permission failures are not treated as transient.
+- Activity collection is read-only; the operator never automates passwords, CAPTCHA, or 2FA.
+- Generated content enters as `draft`; live posting and live engagement each have separate opt-in kill-switches; account-voiced generation is persona fail-closed.
 
 ## Development
 

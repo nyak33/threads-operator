@@ -12,3 +12,6 @@ accounts/*.env
 !accounts/example.env
 .threads-operator/
 browser-profiles/
+
+# Superpowers session scratch (SDD ledgers etc.)
+.superpowers/

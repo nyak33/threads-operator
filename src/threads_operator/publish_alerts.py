@@ -1,9 +1,10 @@
 """Telegram alerts for stalled / failed publish-queue rows.
 
 Sends through the existing operator bot (``TELEGRAM_BOT_TOKEN`` from
-``/home/admin/.hermes/.env``) to the configured home channel. Alerts are
-deduplicated via a small state file so the same row is not re-alerted every
-5-minute cron tick: a row re-alerts only when its attempt count advances.
+``HERMES_ENV_FILE``, default ``~/.hermes/.env``) to the configured home
+channel. Alerts are deduplicated via a small state file so the same row is
+not re-alerted every 5-minute cron tick: a row re-alerts only when its
+attempt count advances.
 """
 
 from __future__ import annotations
@@ -18,8 +19,15 @@ from .supabase_store import SupabaseStore
 
 _MYTZ = timezone(timedelta(hours=8))  # Asia/Kuala_Lumpur (no DST)
 
-_DEFAULT_ENV_FILE = Path("/home/admin/.hermes/.env")
-_DEFAULT_STATE_FILE = Path("/home/admin/.threads-operator/.publish_alert_state.json")
+# Machine-independent defaults: Hermes env file lives under $HOME (overridable
+# via HERMES_ENV_FILE); operator state lives under the operator home
+# (THREADS_OPERATOR_HOME, matching account_config.resolve_home).
+_DEFAULT_ENV_FILE = Path(
+    os.environ.get("HERMES_ENV_FILE")
+    or Path.home() / ".hermes" / ".env")
+_DEFAULT_STATE_FILE = Path(
+    os.environ.get("THREADS_OPERATOR_HOME")
+    or Path.home() / ".threads-operator") / ".publish_alert_state.json"
 # Re-alert only after the row's attempt count has advanced by at least this many
 # since the last alert we sent for it.
 _ATTEMPT_STEP = 1
@@ -139,8 +147,11 @@ def send_publish_alert(
     )
     text = "\n".join(lines)
     token = bot_token or _load_env_value("TELEGRAM_BOT_TOKEN")
-    chat = chat_id or _load_env_value("TELEGRAM_HOME_CHANNEL") or "79553451"
-    if not token:
+    # No hardcoded operator chat id: alerts go to the explicit chat, the
+    # configured home channel, or nowhere (caller sees False). On this VPS
+    # TELEGRAM_HOME_CHANNEL is set in ~/.hermes/.env, so behavior is unchanged.
+    chat = chat_id or _load_env_value("TELEGRAM_HOME_CHANNEL") or _load_env_value("TELEGRAM_CHAT_ID")
+    if not token or not chat:
         return False
     if dry_run:
         return True

@@ -56,10 +56,9 @@ re-claimed, so a post is never published twice.
 4. Install the cron wrapper [`scripts/publish_queue_worker_hermes.py`](../scripts/publish_queue_worker_hermes.py)
    as a Hermes cron job, for example every 5 minutes:
    ```bash
-   hermes cron add \
+   hermes cron create "*/5 * * * *" \
      --name "Publish Queue Worker (syaqir)" \
-     --schedule "*/5 * * * *" \
-     --script /home/admin/threads-operator/scripts/publish_queue_worker_hermes.py \
+     --script "$PWD/scripts/publish_queue_worker_hermes.py" \
      --no-agent
    ```
    Edit `ACCOUNT` (and optionally `CAMPAIGN_CODE`) in the wrapper for your

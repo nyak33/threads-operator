@@ -189,8 +189,8 @@ The worker conditionally claims `approved -> posting` before calling Threads. Th
 For cron-driven publishing use the `publish-worker` command: identical publishing plus automatic requeue of transient failures (network, 429, 5xx, non-OAuth 400) back to `approved` for the next tick, while OAuth/permission errors stay `failed`. Install and verify it per [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md):
 
 ```bash
-hermes cron add --name "Publish Queue Worker (syaqir)" --schedule "*/5 * * * *" \
-  --script /home/admin/threads-operator/scripts/publish_queue_worker_hermes.py \
+hermes cron create "*/5 * * * *" --name "Publish Queue Worker (syaqir)" \
+  --script "$PWD/scripts/publish_queue_worker_hermes.py" \
   --no-agent
 ```
 

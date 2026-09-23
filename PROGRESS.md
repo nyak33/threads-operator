@@ -26,16 +26,25 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 - `personas/syaqir.md` defining the current account's natural Malaysian rojak/bapak-bapak reply voice and anti-fabrication rules.
 - Feature-branch verification: compile succeeded, 136 tests passed with 1 skipped, and dependency audit reported no known vulnerabilities.
 
+## Plug-and-Play Hardening (branch `feat/plug-and-play-hardening`, 2026-09-23)
+
+- Repository reconciliation audited and recorded in `docs/repo-reconciliation.md` (branches classified; VPS-only runtime artifacts categorized A–F).
+- Category A runtime code ported into `scripts/`: insights collector wrapper, activity collector wrapper, stale-claim watchdog, trend-engagement watchdog, own-replies watchdog, trend approval-timeout watchdog, publish alerts, rollup rebuild.
+- Supabase schema reconciliation: 9 production `threads_*` tables had no creating migration; `migrations/013_missing_base_tables_reconcile.sql` recreates the 6 operator-relevant ones from verified evidence (apply BEFORE 010–012 on a fresh project). `migrations/002_post_daily_rollups.sql` consolidated and marked NOT YET APPLIED to production.
+- Machine dependencies removed: `/home/admin` literals eliminated from `src/`/`scripts/`; hardcoded Telegram chat-id fallback removed from publish alerts (alerts no-op when unconfigured); repo-root override renamed `THREADS_OPERATOR_REPO`.
+- `scripts/doctor.sh`: single PASS/WARN/FAIL diagnostic (Python, package, account config, live Supabase connectivity + 12-table schema probe, Telegram, Hermes env/cron, runtime dirs). Verified live (11 pass / 1 warn / 0 fail) and in clean room (correct FAIL modes).
+- `scripts/install_jobs.sh` + `config/runtime-jobs.json` + `config/trend-discovery-prompt.md.tmpl`: declarative, idempotent runtime-job install/converge/remove for the 7 Hermes cron jobs; dry-run and status modes; verified against the live store (7/7 present).
+- Clean-room verification (`docs/fresh-install-verification.md`): fresh clone bootstraps, CLI works, 557 tests pass, no `/home/admin` in code paths. Two real defects found and fixed: missing exec bits on bootstrap/add_account/publish-queue-worker, and a doctor.sh false-PASS on Supabase probe errors.
+- External fresh-Supabase replay (2026-09-23): all 14 migrations applied + idempotency re-run passed; `002` confirmed applied to production. It surfaced a fresh-install RLS/privilege gap — fixed by `migrations/014_fresh_schema_security_reconcile.sql` (enable RLS + revoke anon/authenticated + grant service_role + idempotent policy on the 7 operator tables), regression-guarded by `tests/test_migration_014_security_reconcile.py`. **014 re-replay verified same day:** full chain from zero (`013→014`) on the throwaway project passed with the Security Advisor ERROR cleared and 014 idempotency confirmed; `014` also applied to production (RLS on all 7, zero anon/authenticated grants, service_role policies present, recorded in migration history).
+- Test suite: 565 passed, 1 skipped (baseline 542 + 15 contract tests + 8 migration-014 security regression tests; no test weakened).
+
 ## Deployment Next
 
-1. On the target VPS, clone/update the repository and run bootstrap.
-2. Supply local account credentials and apply the forward database migrations, including `006_security_hardening.sql`.
-3. Establish separate browser profiles only where Activity collection is required.
-4. Run `doctor`, Insights validation, Activity dry-run where applicable, and publish dry-run for every account.
-5. Keep live posting disabled until those account-level checks pass.
-6. Configure Hermes external-trend discovery on deployments that need competitor/content-idea collection; ingest with `trend add --external`, enrich new rows, and alert only on newly inserted candidates.
-7. Create/verify `personas/<account-key>.md` for every account before enabling Hermes-generated engagement replies.
-8. Optionally configure Hermes-owned content generation per deployment; no LLM key is added to Threads Operator and no model is hardcoded in the persona workflow.
+1. ~~Apply `migrations/002_post_daily_rollups.sql` to production Supabase~~ — DONE (externally verified 2026-09-23; table exists, RLS on, PK/indexes present; `rebuild_rollups.py` blocker cleared).
+2. ~~Apply `migrations/014_fresh_schema_security_reconcile.sql` to production Supabase + re-replay the full chain incl. 014 on the throwaway project~~ — DONE (externally verified 2026-09-23: production 014 applied and recorded in migration history, all 7 tables RLS-enabled with service_role policies and zero anon/authenticated grants, `threads_own_reply_engagement` error cleared; throwaway re-replay of `013→014` passed, 014 idempotent, Security Advisor ERROR cleared).
+3. Reconcile/retire old remote branches per `docs/repo-reconciliation.md` classifications (user sign-off required before deletion).
+4. ~~Fresh-VPS end-to-end run including a throwaway Supabase project replay of all migrations incl. 014~~ — DONE (see `docs/fresh-install-verification.md`; only live-posting/browser steps remain deliberately out of scope).
+5. Multi-account hardening soak (per-account failure isolation under simultaneous operation).
 
 ## Deliberately Later / Non-Goals
 
