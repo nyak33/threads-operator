@@ -52,7 +52,7 @@ This is the first real (non-synthetic) task executed under the Superpowers workf
 - Required and received: none for code. User-only actions:
   1. ~~Apply `migrations/002_post_daily_rollups.sql` to production~~ — DONE (user, 2026-09-23; blocker cleared).
   2. ~~Provide a throwaway Supabase project for the full migration replay~~ — DONE (user, 2026-09-23; replay executed, surfaced the RLS defect).
-  3. Apply `migrations/014_fresh_schema_security_reconcile.sql` to production + re-replay the chain incl. 014 on the throwaway project to confirm the Security Advisor ERROR clears (pending).
+  3. ~~Apply `migrations/014_fresh_schema_security_reconcile.sql` to production + re-replay the chain incl. 014 on the throwaway project to confirm the Security Advisor ERROR clears~~ — DONE (user, 2026-09-23; both verified, ERROR cleared, 014 idempotent and recorded in production migration history).
   4. Sign off on old remote branch/worktree/stash deletions (irreversible Git action — correctly gated; still pending).
 
 ## Scope discipline
@@ -66,5 +66,5 @@ This is the first real (non-synthetic) task executed under the Superpowers workf
 - Clean room: fresh clone → bootstrap → CLI → 557 tests → account scaffold → doctor (accurate PASS/WARN/FAIL) → runtime-job status. Two defects found and fixed in-repo.
 - Live doctor: 11 pass / 1 warn / 0 fail (the warn was the pending 002 — now resolved in production).
 - Runtime jobs: 7/7 present in the live Hermes store and matching the manifest.
-- External migration replay (user): 14/14 applied + idempotency re-run zero errors; surfaced the fresh-install RLS defect → remediated with 014.
-- **Not declared complete on push.** Remaining: apply 014 to production + re-replay the chain incl. 014 on the throwaway project, and the user sign-off for branch/worktree/stash cleanup. Plug-and-play status: **READY WITH MANUAL CONFIGURATION** (one remaining security-reconcile re-verification before merge to main).
+- External migration replay (user): 14/14 applied + idempotency re-run zero errors; surfaced the fresh-install RLS defect → remediated with 014. **014 re-replay verified (2026-09-23):** full chain `013→014` from zero on the throwaway project passed, 014 idempotent, Security Advisor ERROR cleared; 014 also applied to production and recorded in migration history.
+- **Not declared complete on push.** All Supabase migration actions are now closed. Remaining: user sign-off for branch/worktree/stash cleanup. Plug-and-play status: **READY**.

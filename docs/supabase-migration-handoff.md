@@ -104,8 +104,14 @@ Run these against the fresh database after applying the 14 files in order. Expec
 ### 2026-09-23 update — external fresh-replay verification + 014 remediation
 
 Independent verification (user-performed) against a throwaway Supabase project:
-- **Production:** `002_post_daily_rollups.sql` applied successfully — the `rebuild_rollups.py` blocker is cleared.
+- **Production:** `002_post_daily_rollups.sql` applied successfully — the `rebuild_rollups.py` blocker is cleared. `014_fresh_schema_security_reconcile.sql` also applied to production: all 7 affected tables RLS-enabled, anon/authenticated grants zero, intended service_role policies present, the previous `threads_own_reply_engagement` Security Advisor error cleared, and 014 recorded in the production migration history.
 - **Fresh DB:** all 14 migrations (`013,001,001b,002,003,004,005,006,007,008,009,010,011,012`) applied cleanly, and idempotency re-run passed with zero errors. View, 4 FKs, and the `backlog`/`discarded` CHECK all verified present.
 - **Defect found:** the fresh DB did NOT reproduce production's RLS posture. RLS stayed **disabled** on `threads_trend_candidates`, `threads_engagement_config`, `threads_gateway_keys`, `threads_posts`, `threads_inbound_replies`, `threads_post_metric_snapshots`, `threads_own_reply_engagement`, and Supabase Security Advisor reported **ERROR: threads_own_reply_engagement is public but RLS is not enabled** (anon/authenticated also held privileges on it). Root cause: 013 revokes but never enables RLS; 010 creates `threads_own_reply_engagement` with no grant/revoke/RLS section.
 - **Remediation:** `migrations/014_fresh_schema_security_reconcile.sql` (new, additive, idempotent) enables RLS + revokes anon/authenticated + grants service_role (per-table, mirroring 013) + creates an idempotent `service_role_all_*` policy on each of the 7 tables. Apply it **last**. Regression-guarded by `tests/test_migration_014_security_reconcile.py`.
-- Fresh-install migration order is now `013,001,001b,002,003,004,005,006,007,008,009,010,011,012,014`. Re-replay on the throwaway project to confirm the Security Advisor ERROR clears before merging to main.
+- Fresh-install migration order is now `013,001,001b,002,003,004,005,006,007,008,009,010,011,012,014`.
+
+### 2026-09-23 FINAL — 014 re-replay verification complete (external)
+
+- **Throwaway fresh DB:** full chain from zero re-played in the verified order `013,001,001b,002,003,004,005,006,007,008,009,010,011,012,014` — all applied successfully. 014 re-run completed with **zero errors** (idempotency confirmed). All 7 affected tables RLS-enabled, anon/authenticated access removed, intended service_role policies present, and the previous Supabase Security Advisor ERROR is **cleared**.
+- **Production:** 014 applied successfully and recorded in the production migration history; post-014 verification confirms RLS on all 7, zero anon/authenticated grants, service_role policies present, `threads_own_reply_engagement` security error cleared.
+- **Status: no remaining Supabase migration actions.** The fresh-install chain is reproducible from zero including the production security posture.
