@@ -88,12 +88,18 @@ TREND_STATUSES = frozenset(
         # own post, approval-gated, enqueued through the normal publisher.
         "drafted",
         "pending_approval",
+        "approved",
         "queued",
         "skipped",
         "posted",
         "failed",
+        # Workflow A backlog (migration 012): unapproved drafts kept durable.
+        "backlog",
+        "discarded",
     }
 )
+
+_APPROVAL_TIMEOUT_HOURS = 24
 
 # Explicit SELECT column allowlist: evidence fields only. Analysis fields
 # (topic/tone/score...) are intentionally not fetched or fabricated here;
@@ -800,6 +806,8 @@ class SupabaseStore:
             "adaptation_angle",
             "why_it_works",
             "used_in_queue_id",
+            "approval_sent_at",
+            "timed_out_at",
             "raw_metadata",
         }
         body: dict[str, Any] = {}
@@ -902,6 +910,117 @@ class SupabaseStore:
             if isinstance(row, dict) and row.get("target_account_id") == account_key:
                 return row
         return None
+
+    # ------------------------------------------------- Workflow A backlog
+
+    def list_trend_backlog(
+        self,
+        *,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """SELECT unused backlog items for this account, newest timed_out first.
+
+        Only returns rows whose ``status = 'backlog'`` and
+        ``used_in_queue_id IS NULL`` (never enqueued). Account isolation is
+        enforced via ``self.account_key`` — callers cannot probe another
+        identity. No writes, no LLM, no browser.
+        """
+        account_key = self._require_account_key()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        params: dict[str, Any] = {
+            "select": ",".join(TREND_EVIDENCE_COLUMNS),
+            "target_account_id": f"eq.{account_key}",
+            "status": "eq.backlog",
+            "used_in_queue_id": "is.null",
+            "order": "timed_out_at.desc",
+            "limit": str(limit),
+        }
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params=params,
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
+
+    def transition_trend_candidate_backlog(
+        self,
+        *,
+        candidate_id: int,
+        timed_out_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS ``pending_approval`` -> ``backlog`` for one row.
+
+        Only fires when the row is still ``pending_approval``. Any other
+        status (approved/queued/rejected/skipped/posted/failed/backlog)
+        returns None. Idempotent by construction: a second invocation on the
+        same row sees ``status != pending_approval`` and does nothing.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        ts = timed_out_at or self._utc_now()
+        body: dict[str, Any] = {
+            "status": "backlog",
+            "timed_out_at": ts,
+            "updated_at": self._utc_now(),
+        }
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+                "status": "eq.pending_approval",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("target_account_id") == account_key:
+                return row
+        return None
+
+    def find_stale_pending_approvals(
+        self,
+        *,
+        older_than_hours: int = _APPROVAL_TIMEOUT_HOURS,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """SELECT pending_approval rows whose approval card was sent > cutoff.
+
+        Rows with ``approval_sent_at IS NULL`` fall back to ``updated_at``.
+        The caller must CAS each row through
+        :meth:`transition_trend_candidate_backlog` before treating it as
+        timed out — this read is only a hint, not the actual transition.
+        """
+        account_key = self._require_account_key()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("limit must be an integer between 1 and 500")
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+        ).isoformat()
+        params: dict[str, Any] = {
+            "select": "id,status,approval_sent_at,updated_at",
+            "target_account_id": f"eq.{account_key}",
+            "status": "eq.pending_approval",
+            "or": f"(approval_sent_at.lt.{cutoff},and(approval_sent_at.is.null,updated_at.lt.{cutoff}))",
+            "order": "approval_sent_at.asc.nullsfirst,updated_at.asc",
+            "limit": str(limit),
+        }
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers=self._headers,
+            params=params,
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
 
     # --------------------------------------- Workflow B: own-post reply states
 

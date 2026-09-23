@@ -36,6 +36,9 @@ TRENDENG_ACTIONS = ("approve", "edit", "reject", "skip")
 OWNREPLY_PREFIX = "ownreply:"
 OWNREPLY_ACTIONS = ("approve", "edit", "reject", "ignore")
 
+BACKLOG_PREFIX = "backlog:"
+BACKLOG_ACTIONS = ("use", "edit", "refresh", "discard", "next")
+
 CANCEL_WORDS = {"cancel"}
 MAX_CHARS = 500
 
@@ -84,6 +87,45 @@ def ownreply_keyboard(row_id: int) -> dict[str, Any]:
             ],
         ]
     }
+
+
+def backlog_keyboard(candidate_id: int) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Use", "callback_data": f"backlog:use:{candidate_id}"},
+                {"text": "✏️ Edit", "callback_data": f"backlog:edit:{candidate_id}"},
+                {"text": "🔄 Refresh", "callback_data": f"backlog:refresh:{candidate_id}"},
+            ],
+            [
+                {"text": "🗑️ Discard", "callback_data": f"backlog:discard:{candidate_id}"},
+                {"text": "➡️ Next", "callback_data": f"backlog:next:{candidate_id}"},
+            ],
+        ]
+    }
+
+
+def backlog_card_text(item: dict[str, Any]) -> str:
+    """Render one backlog item for Telegram. No credentials or secrets."""
+    wa = (item.get("raw_metadata") or {}).get("workflow_a") or {}
+    draft = str(wa.get("draft_text") or "").strip()
+    preview = draft if len(draft) <= 200 else draft[:197] + "..."
+    topic = item.get("topic") or wa.get("topic") or "n/a"
+    username = item.get("source_username") or "unknown"
+    permalink = item.get("source_permalink") or "n/a"
+    timed_out = item.get("timed_out_at") or item.get("updated_at") or "n/a"
+    lines = [
+        "🗄️ CONTENT BACKLOG",
+        "",
+        f"Candidate #{item.get('id')}",
+        f"Topic: {topic}",
+        f"Age: {timed_out}",
+        f"Source: @{username}",
+        f"URL: {permalink}",
+        "",
+        f"Draft ({len(draft)} chars):\n{preview}",
+    ]
+    return "\n".join(lines)
 
 
 async def _run_cli(
@@ -234,14 +276,14 @@ class _BaseWorkflowDispatcher:
         )
         if code != 0 or not payload.get("ok"):
             err = _err(payload)
-            if "not pending" in err.lower() or "not in an open state" in err.lower():
+            if "not pending" in err.lower() or "not in an open state" in err.lower() or "not backlog" in err.lower():
                 self.store.remove(session["token"])
-                await self._send(text=f"⚠️ #{row_id} is no longer awaiting approval; edit session closed.")
+                await self._send(text=f"⚠️ #{row_id} is no longer awaiting edits; edit session closed.")
             else:
                 await self._send(text=f"❌ Edit failed for #{row_id}: {err} — session still open; send new text or 'cancel'.")
             return True
         self.store.remove(session["token"])
-        await self._send(text=f"✏️ #{row_id} updated — still pending approval.")
+        await self._send(text=f"✏️ #{row_id} updated — still in backlog.")
         return True
 
 
@@ -263,6 +305,112 @@ class OwnReplyDispatcher(_BaseWorkflowDispatcher):
     edit_prompt = "Send the new reply text, or 'cancel'."
 
 
+class TrendBacklogDispatcher(_BaseWorkflowDispatcher):
+    """Workflow A backlog: backlog: callbacks -> trend-engagement CLI group."""
+
+    group = "trend-engagement"
+    prefix = BACKLOG_PREFIX
+    actions = BACKLOG_ACTIONS
+    edit_prompt = "Send the new draft text for this backlog post, or 'cancel'."
+
+    async def handle_callback(
+        self,
+        *,
+        data: str,
+        chat_id: str,
+        user_id: str,
+        message_id: str | None = None,
+        answer: AnswerFn | None = None,
+    ) -> bool:
+        parsed = parse_prefixed_callback(data, self.prefix, self.actions)
+        if parsed is None:
+            return False
+        action, row_id = parsed
+        if action == "edit":
+            await self._start_edit(row_id, chat_id=str(chat_id), user_id=str(user_id), answer=answer)
+            return True
+        if action == "next":
+            # Re-render the backlog list starting after this item.
+            await self._send_backlog_list(chat_id=str(chat_id), after_id=row_id)
+            await self._answer(answer, "Next backlog item.")
+            return True
+        await self._decide(row_id, action, chat_id=str(chat_id), message_id=message_id, answer=answer)
+        return True
+
+    async def _decide(
+        self, row_id: int, action: str, *, chat_id: str, message_id: str | None, answer: AnswerFn | None
+    ) -> None:
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            [action, "--account", self.account, "--id", str(row_id)],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            err = _err(payload)
+            if "already_queued" in str(payload):
+                await self._answer(answer, "✅ Already enqueued from this backlog item.")
+                return
+            if "expired" in err.lower() or "moved to content backlog" in err.lower():
+                await self._answer(answer, "This approval expired and was moved to Content Backlog.")
+                return
+            await self._answer(answer, f"❌ {action.title()} failed: {err}")
+            return
+
+        if action == "use":
+            note = f"✅ Enqueued (queue #{payload.get('queue_id')}) — topic preserved: {payload.get('topic')}."
+        elif action == "refresh":
+            note = "🔄 Draft refreshed — still in backlog for review."
+        elif action == "discard":
+            note = "🗑️ Discarded. The content is kept but no longer shown as active backlog."
+        else:
+            note = f"✅ {action.title()} recorded."
+
+        await self._answer(answer, note)
+
+        # Refresh the card inline if possible, removing the action buttons.
+        if action in ("use", "discard") and self._edit is not None and message_id:
+            try:
+                await self._edit(
+                    str(chat_id), str(message_id),
+                    f"{note}\n\n(Item #{row_id})",
+                    None,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("backlog card edit failed", exc_info=True)
+
+    async def handle_command(self, chat_id: str) -> None:
+        """Entry point for the Telegram ``/content-backlog`` command."""
+        await self._send_backlog_list(chat_id=str(chat_id))
+
+    async def _send_backlog_list(
+        self, chat_id: str, after_id: int | None = None
+    ) -> None:
+        """Fetch and render the next backlog item after ``after_id``."""
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            ["backlog", "--account", self.account, "--limit", "20"],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            await self._send(
+                chat_id,
+                f"❌ Could not load content backlog: {_err(payload)}",
+            )
+            return
+        items = payload.get("items") or []
+        if after_id is not None:
+            items = [item for item in items if item.get("id") != after_id]
+        if not items:
+            await self._send(chat_id, "🗄️ Content Backlog is empty.")
+            return
+        item = items[0]
+        await self._send(
+            chat_id,
+            backlog_card_text(item),
+            markup=backlog_keyboard(int(item["id"])),
+        )
+
+
 # Aliases used by the Hermes Telegram gateway adapter (do not remove).
 class TrendEngagementTelegramBridge(TrendEngagementDispatcher):
     """Gateway-compatible alias for Workflow A."""
@@ -270,3 +418,7 @@ class TrendEngagementTelegramBridge(TrendEngagementDispatcher):
 
 class OwnReplyTelegramBridge(OwnReplyDispatcher):
     """Gateway-compatible alias for Workflow B."""
+
+
+class TrendBacklogTelegramBridge(TrendBacklogDispatcher):
+    """Gateway-compatible alias for the Workflow A backlog UX."""

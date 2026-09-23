@@ -229,3 +229,50 @@ def card_text(candidate: dict[str, Any], proposal: dict[str, Any]) -> str:
         f"Score: {proposal.get('relevance_score', 0):.2f}\n"
         f"Candidate #{candidate.get('id')}"
     )
+
+
+def refresh_original_draft(
+    candidate: dict[str, Any],
+    *,
+    persona_text: str,
+    providers: list[content_generation.LLMProviderSpec] | None = None,
+    client: Any = None,
+) -> str:
+    """Rewrite the backlog draft using the original context/source.
+
+    The provider chain is resolved dynamically from config — never hardcoded.
+    The result is still bounded by the Threads character limit.
+    """
+    wa = (candidate.get("raw_metadata") or {}).get("workflow_a") or {}
+    user_prompt = (
+        f"Original trend angle: {wa.get('angle') or ''}\n"
+        f"Why it fits this account: {wa.get('reason') or ''}\n"
+        f"Previous draft (for tone reference only):\n{wa.get('draft_text') or ''}\n"
+        f"Source post (REFERENCE ONLY — do not copy wording):\n"
+        f"{(candidate.get('source_text') or '')[:800]}\n\n"
+        "Write a fresh standalone post now."
+    )
+    draft = content_generation.generate_text(
+        system_prompt=_draft_system_prompt(persona_text),
+        user_prompt=user_prompt,
+        providers=providers,
+        client=client,
+    )
+    if len(draft) > THREADS_CHAR_LIMIT:
+        compress_prompt = (
+            f"Your previous draft was {len(draft)} characters — over the "
+            f"{THREADS_CHAR_LIMIT} limit. Rewrite it under the limit, same angle, "
+            f"same voice. Previous draft:\n{draft}"
+        )
+        draft = content_generation.generate_text(
+            system_prompt=_draft_system_prompt(persona_text),
+            user_prompt=compress_prompt,
+            providers=providers,
+            client=client,
+        )
+    if len(draft) > THREADS_CHAR_LIMIT:
+        raise ValueError(
+            f"draft still over {THREADS_CHAR_LIMIT} chars after compression retry "
+            f"({len(draft)} chars)"
+        )
+    return draft

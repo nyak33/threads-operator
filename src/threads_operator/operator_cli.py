@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -35,6 +36,8 @@ from .safe_errors import redact_error
 from .supabase_store import SupabaseStore, TREND_STATUSES, trend_candidate_payload
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
 from .trend_urls import normalize_threads_post_url
+
+logger = logging.getLogger(__name__)
 
 _EXECUTION_MODES = {"draft_only", "approval_required", "auto_post"}
 
@@ -231,6 +234,37 @@ def _parser() -> argparse.ArgumentParser:
     trendeng_skip.add_argument("--account")
     trendeng_skip.add_argument("--id", type=int, required=True)
     trendeng_skip.add_argument("--approval-ref", default=None)
+
+    trendeng_backlog = trendeng_sub.add_parser(
+        "backlog", help="List unused backlog content (approval expired)"
+    )
+    trendeng_backlog.add_argument("--account")
+    trendeng_backlog.add_argument("--limit", type=int, default=10)
+
+    trendeng_timeout = trendeng_sub.add_parser(
+        "timeout", help="Move stale pending_approval drafts into backlog"
+    )
+    trendeng_timeout.add_argument("--account")
+    trendeng_timeout.add_argument("--older-than-hours", type=int, default=24)
+    trendeng_timeout.add_argument("--dry-run", action="store_true")
+
+    trendeng_use = trendeng_sub.add_parser(
+        "use", help="Enqueue one backlog item into the publish queue"
+    )
+    trendeng_use.add_argument("--account")
+    trendeng_use.add_argument("--id", type=int, required=True)
+
+    trendeng_refresh = trendeng_sub.add_parser(
+        "refresh", help="Rewrite one backlog draft with the current LLM"
+    )
+    trendeng_refresh.add_argument("--account")
+    trendeng_refresh.add_argument("--id", type=int, required=True)
+
+    trendeng_discard = trendeng_sub.add_parser(
+        "discard", help="Mark one backlog item as discarded (kept in DB)"
+    )
+    trendeng_discard.add_argument("--account")
+    trendeng_discard.add_argument("--id", type=int, required=True)
 
     ownreply = sub.add_parser(
         "own-replies",
@@ -1008,9 +1042,13 @@ def _run_trendeng_edit(
                    "error": f"edited draft is {len(text)} chars (limit 500)"}
     store = _store(config)
     candidate = store.get_trend_candidate(candidate_id)
-    if candidate is None or candidate.get("status") != "pending_approval":
+    if candidate is None:
         return 2, {"ok": False, "account": config.name,
-                   "error": "candidate is not pending_approval (or not this account)"}
+                   "error": "candidate not found (or not this account)"}
+    current_status = candidate.get("status")
+    if current_status not in ("pending_approval", "backlog"):
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate is {current_status}, not pending_approval/backlog"}
     raw = dict(candidate.get("raw_metadata") or {})
     wa = dict(raw.get("workflow_a") or {})
     wa["draft_text"] = text
@@ -1021,6 +1059,235 @@ def _run_trendeng_edit(
     )
     return 0, {"ok": True, "account": config.name, "id": candidate_id,
                "updated": updated is not None, "draft_text": text}
+
+
+def _run_trendeng_skip(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    return _trendeng_set_status(
+        config,
+        candidate_id=candidate_id,
+        from_status="pending_approval",
+        to_status="skipped",
+    )
+
+
+# --------------------------------------------------------------------------
+# Workflow A: approval timeout + content backlog
+# --------------------------------------------------------------------------
+
+def _run_trendeng_backlog(
+    config: AccountConfig, *, limit: int
+) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    rows = store.list_trend_backlog(limit=limit)
+    out = []
+    for row in rows:
+        wa = (row.get("raw_metadata") or {}).get("workflow_a") or {}
+        out.append({
+            "id": row.get("id"),
+            "status": row.get("status"),
+            "source_username": row.get("source_username"),
+            "source_permalink": row.get("source_permalink"),
+            "source_text": row.get("source_text"),
+            "topic": row.get("topic"),
+            "trend_score": row.get("trend_score"),
+            "draft_text": wa.get("draft_text"),
+            "reason": wa.get("reason"),
+            "angle": wa.get("angle"),
+            "approval_sent_at": row.get("approval_sent_at"),
+            "timed_out_at": row.get("timed_out_at"),
+            "used_in_queue_id": row.get("used_in_queue_id"),
+        })
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "count": len(out),
+        "items": out,
+    }
+
+
+def _run_trendeng_timeout(
+    config: AccountConfig, *, older_than_hours: int, dry_run: bool
+) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    stale = store.find_stale_pending_approvals(
+        older_than_hours=older_than_hours, limit=100
+    )
+    if dry_run:
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "dry_run": True,
+            "stale_count": len(stale),
+            "ids": [row.get("id") for row in stale],
+        }
+    moved = 0
+    errors = []
+    for row in stale:
+        try:
+            result = store.transition_trend_candidate_backlog(
+                candidate_id=int(row["id"])
+            )
+            if result is not None:
+                moved += 1
+        except Exception as exc:  # noqa: BLE001 - one row must not kill the batch
+            errors.append({"id": row.get("id"), "error": str(exc)})
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "moved_to_backlog": moved,
+        "errors": errors,
+    }
+
+
+def _run_trendeng_use(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Enqueue one backlog item through the EXISTING enqueue_draft path."""
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate {candidate_id} not found for this account",
+        }
+    if candidate.get("used_in_queue_id"):
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "id": candidate_id,
+            "status": candidate.get("status"),
+            "queue_id": candidate.get("used_in_queue_id"),
+            "already_queued": True,
+        }
+    if candidate.get("status") != "backlog":
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate is {candidate.get('status')}, not backlog",
+        }
+
+    wa = (candidate.get("raw_metadata") or {}).get("workflow_a") or {}
+    draft = (wa.get("draft_text") or "").strip()
+    if not draft:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "no draft text on candidate — refresh before use",
+        }
+    if len(draft) > 500:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"draft is {len(draft)} chars (limit 500)",
+        }
+    topic = (candidate.get("topic") or wa.get("topic") or "").strip() or None
+    if not topic:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "no topic on candidate — cannot preserve topic end-to-end",
+        }
+
+    # CAS backlog -> approved first so a double-use races here instead of
+    # double-enqueueing.
+    moved = store.transition_trend_candidate(
+        candidate_id=candidate_id, from_status="backlog", to_status="approved"
+    )
+    if moved is None:
+        current = store.get_trend_candidate(candidate_id) or {}
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "id": candidate_id,
+            "status": current.get("status"),
+            "queue_id": current.get("used_in_queue_id"),
+            "already_queued": bool(current.get("used_in_queue_id")),
+        }
+
+    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+    campaign = config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
+    queue_row = store.enqueue_draft(
+        table, draft, reply_texts=[], campaign_code=campaign, topic=topic
+    )
+    finished = store.update_trend_candidate_workflow_a(
+        candidate_id=candidate_id,
+        fields={"status": "queued", "used_in_queue_id": int(queue_row["id"])},
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "id": candidate_id,
+        "status": (finished or {}).get("status", "queued"),
+        "queue_id": queue_row.get("id"),
+        "topic": topic,
+    }
+
+
+def _run_trendeng_refresh(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Rewrite one backlog draft with the current configured LLM/persona."""
+    from . import trend_engagement
+
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate {candidate_id} not found for this account",
+        }
+    if candidate.get("status") != "backlog":
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate is {candidate.get('status')}, not backlog",
+        }
+
+    persona_text = trend_engagement.load_persona(_personas_root(), config.name)
+    draft = trend_engagement.refresh_original_draft(
+        candidate, persona_text=persona_text
+    )
+    raw = dict(candidate.get("raw_metadata") or {})
+    wa = dict(raw.get("workflow_a") or {})
+    wa["draft_text"] = draft
+    wa["refreshed_at"] = store._utc_now()
+    raw["workflow_a"] = wa
+    updated = store.update_trend_candidate_workflow_a(
+        candidate_id=candidate_id, fields={"raw_metadata": raw}
+    )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "id": candidate_id,
+        "updated": updated is not None,
+        "draft_text": draft,
+    }
+
+
+def _run_trendeng_discard(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    moved = store.transition_trend_candidate(
+        candidate_id=candidate_id, from_status="backlog", to_status="discarded"
+    )
+    if moved is None:
+        current = store.get_trend_candidate(candidate_id) or {}
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate is {current.get('status')}, not backlog",
+        }
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "id": candidate_id,
+        "status": "discarded",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1373,10 +1640,21 @@ def main(
                 from_status="pending_approval", to_status="rejected",
             )
         elif args.command == "trend-engagement" and args.trendeng_command == "skip":
-            code, payload = _trendeng_set_status(
-                config, candidate_id=args.id,
-                from_status="pending_approval", to_status="skipped",
+            code, payload = _run_trendeng_skip(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "backlog":
+            code, payload = _run_trendeng_backlog(config, limit=args.limit)
+        elif args.command == "trend-engagement" and args.trendeng_command == "timeout":
+            code, payload = _run_trendeng_timeout(
+                config, older_than_hours=args.older_than_hours, dry_run=args.dry_run
             )
+        elif args.command == "trend-engagement" and args.trendeng_command == "use":
+            code, payload = _run_trendeng_use(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "edit":
+            code, payload = _run_trendeng_edit(config, candidate_id=args.id, text=args.text)
+        elif args.command == "trend-engagement" and args.trendeng_command == "refresh":
+            code, payload = _run_trendeng_refresh(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "discard":
+            code, payload = _run_trendeng_discard(config, candidate_id=args.id)
         elif args.command == "own-replies" and args.ownreply_command == "scan":
             code, payload = _run_ownreply_scan(
                 config, limit=args.limit, propose=args.propose, dry_run=args.dry_run
