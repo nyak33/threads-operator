@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .content_rules import validate_standard_post_text
+
 DEFAULT_BASE_URL = "https://graph.threads.net/v1.0"
 POST_METRICS = ("views", "likes", "replies", "reposts", "quotes", "shares")
 ACCOUNT_METRICS = (
@@ -233,8 +235,7 @@ class ThreadsAPI:
         ``topic_tag`` (when given) is attached at container creation, which is
         the request Meta expects it on; it is not part of the publish call.
         """
-        if not text or not text.strip():
-            raise ValueError("Threads text must not be empty")
+        validate_standard_post_text(text)
         data: dict[str, str] = {
             "access_token": self.access_token,
             "media_type": "TEXT",
