@@ -14,6 +14,7 @@ credentials or content.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -189,11 +190,49 @@ class _BaseWorkflowDispatcher:
         self._send = send
         self._edit = edit or edit_message
         self.cli_argv = cli_argv or list(DEFAULT_CLI)
-        self.cwd = cwd
+        self.cwd = cwd if cwd is not None else self._default_cwd()
+        self._verify_cli_exists()
         if edit_store is None:
             default_path = Path.home() / ".threads-operator" / "engagement_edit_sessions.json"
             edit_store = PendingEditStore(default_path)
         self.store = edit_store
+
+    @staticmethod
+    def _default_cwd() -> str | None:
+        """Resolve the repo root (dir containing pyproject.toml) from this file.
+
+        The gateway instantiates these dispatchers without a cwd; the CLI is a
+        relative path (.venv/bin/threads-operator) that only resolves from the
+        repo root. Mirrors EngagementTelegramBridge._default_cwd.
+        """
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            if (parent / "pyproject.toml").exists():
+                return str(parent)
+        return None
+
+    def _verify_cli_exists(self) -> None:
+        """Fail fast with a clear diagnostic when the CLI binary is missing."""
+        argv0 = self.cli_argv[0] if self.cli_argv else ""
+        if not argv0 or os.path.isabs(argv0):
+            return
+        if self.cwd is None:
+            logger.warning(
+                "workflow dispatcher: no repo root found (pyproject.toml) and "
+                "cli_argv[0]=%r is relative — subprocess will fail with "
+                "FileNotFoundError from the caller's cwd",
+                argv0,
+            )
+            return
+        candidate = Path(self.cwd) / argv0
+        if not candidate.exists():
+            logger.warning(
+                "workflow dispatcher: CLI binary %s does not exist under "
+                "resolved cwd %s — callbacks will fail (argv=%r)",
+                argv0,
+                self.cwd,
+                self.cli_argv,
+            )
 
     async def _answer(self, answer: AnswerFn | None, text: str) -> None:
         if answer is not None:
