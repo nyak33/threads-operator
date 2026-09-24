@@ -2,8 +2,16 @@
 """Workflow A watchdog: draft trend candidates -> Telegram approval cards.
 
 Runs the threads-operator trend-engagement draft command for the configured
-account, then sends one Telegram approval card per newly drafted candidate.
-Approval buttons carry only `trendeng:<action>:<id>` — never content or credentials.
+account. The CLI now owns Telegram delivery: each newly drafted candidate
+gets exactly one approval card, and only after a confirmed send does the
+store transition to ``pending_approval`` with ``approval_sent_at`` set.
+
+Legacy rows stuck in ``pending_approval`` with ``approval_sent_at IS NULL``
+(cards never delivered under the old broken flow) are also recovered: the
+watchdog sends their card once via ``trend-engagement telegram-send``, which
+stamps ``approval_sent_at = now()`` after confirmed delivery. The stamp is
+CAS-guarded (``approval_sent_at IS NULL``) so repeat watchdog runs can never
+emit duplicate cards.
 
 Schedule: every 30 minutes (cron-managed). Nothing in this script publishes;
 approval enqueues into the normal publish queue which the existing
@@ -16,7 +24,6 @@ import json
 import os
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 REPO = os.environ.get("THREADS_OPERATOR_REPO", str(Path(__file__).resolve().parent.parent))
@@ -27,47 +34,9 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def send_card(text: str, candidate_id: int) -> None:
-    if not BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN not set; card not sent", file=sys.stderr)
-        return
-    if not CHAT_ID:
-        print("TELEGRAM_CHAT_ID not set; card not sent", file=sys.stderr)
-        return
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Approve", "callback_data": f"trendeng:approve:{candidate_id}"},
-                {"text": "✏️ Edit", "callback_data": f"trendeng:edit:{candidate_id}"},
-            ],
-            [
-                {"text": "❌ Reject", "callback_data": f"trendeng:reject:{candidate_id}"},
-                {"text": "⏭️ Skip", "callback_data": f"trendeng:skip:{candidate_id}"},
-            ],
-        ]
-    }
-    body = json.dumps({
-        "chat_id": CHAT_ID,
-        "text": text[:4000],
-        "reply_markup": keyboard,
-    }).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read().decode() or "{}")
-        if not result.get("ok"):
-            print(f"telegram send failed: {result}", file=sys.stderr)
-    except Exception as exc:  # noqa: BLE001
-        print(f"telegram send error: {exc}", file=sys.stderr)
-
-
-def main() -> int:
+def _run_cli(args: list[str], *, cli_prefix: list[str] | None = None) -> dict:
     proc = subprocess.run(
-        [*CLI, "draft", "--account", ACCOUNT, "--limit", "5"],
+        [*(cli_prefix or CLI), *args, "--account", ACCOUNT],
         cwd=REPO,
         capture_output=True,
         text=True,
@@ -75,22 +44,53 @@ def main() -> int:
     )
     out = proc.stdout.strip()
     try:
-        payload = json.loads(out) if out else {}
+        return json.loads(out) if out else {}
     except json.JSONDecodeError:
         print(f"non-JSON CLI output rc={proc.returncode}: {proc.stderr[:300]}", file=sys.stderr)
+        return {}
+
+
+TREND_CLI = [".venv/bin/threads-operator", "trend"]
+
+
+def main() -> int:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping delivery", file=sys.stderr)
+        return 1
+
+    # 1. New drafts -> pending_approval (CLI sends Telegram first, then stamps)
+    payload = _run_cli(["draft", "--limit", "5"])
+    if not payload:
         return 1
     if not payload.get("ok"):
         print(f"draft run failed: {payload}", file=sys.stderr)
         return 1
-    for item in payload.get("drafted") or []:
-        card = item.get("card")
-        cid = item.get("id")
-        if card and cid:
-            send_card(card, int(cid))
+
+    # 2. Recover legacy rows: pending_approval with approval_sent_at IS NULL
+    legacy_sent = 0
+    legacy_failed = 0
+    pending = _run_cli(["list", "--status", "pending_approval", "--limit", "50"])
+    if pending.get("ok"):
+        for row in pending.get("candidates") or []:
+            cid = row.get("id")
+            if not cid:
+                continue
+            show = _run_cli(["show", "--id", str(cid)], cli_prefix=TREND_CLI)
+            candidate = (show or {}).get("candidate") or {}
+            if not candidate or candidate.get("approval_sent_at"):
+                continue
+            send = _run_cli(["telegram-send", "--id", str(cid)])
+            if send.get("ok") and not send.get("skipped"):
+                legacy_sent += 1
+            elif not send.get("ok"):
+                legacy_failed += 1
+
     print(json.dumps({
         "drafted": payload.get("drafted_count", 0),
         "skipped": payload.get("skipped_count", 0),
         "errors": payload.get("error_count", 0),
+        "legacy_cards_sent": legacy_sent,
+        "legacy_cards_failed": legacy_failed,
     }))
     return 0
 

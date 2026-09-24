@@ -255,14 +255,20 @@ def test_pending_approval_over_24h_moves_to_backlog(store, backend):
     assert moved["timed_out_at"] is not None
 
 
-def test_pending_approval_over_24h_no_approval_sent_at_uses_updated_at(store, backend):
+def test_pending_approval_null_approval_sent_at_never_times_out(store, backend):
+    """STRICT RULE: approval_sent_at IS NULL must NEVER time out into backlog.
+
+    The old fallback (approval_sent_at NULL -> updated_at) moved rows whose
+    Telegram card was never delivered. That fallback is removed; even an
+    ancient updated_at must not make the row stale.
+    """
     row = _seed_candidate(
         store, backend, status="pending_approval",
         approval_sent_at=None,
         updated_at="2026-09-20T00:00:00+00:00",
     )
     stale = store.find_stale_pending_approvals(older_than_hours=24)
-    assert row["id"] in [r["id"] for r in stale]
+    assert row["id"] not in [r["id"] for r in stale]
 
 
 # --------------------------------------------------------------------------

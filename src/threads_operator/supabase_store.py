@@ -987,6 +987,117 @@ class SupabaseStore:
                 return row
         return None
 
+    def mark_trend_candidate_approval_sent(
+        self,
+        *,
+        candidate_id: int,
+        sent_at: str | None = None,
+        approval_ref: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Record confirmed Telegram delivery for one row.
+
+        Sets ``approval_sent_at`` and persists the Telegram message reference
+        (``"<chat_id>:<message_id>"``) in ``raw_metadata.workflow_a`` under
+        ``approval_ref``/``approval_message`` so approval cards can be
+        correlated with their Telegram message.
+
+        Idempotent claim: only writes when the row is ``pending_approval`` or
+        ``drafted`` AND ``approval_sent_at IS NULL``. A second invocation
+        (repeat watchdog run, concurrent worker) sees a non-null
+        ``approval_sent_at`` and does nothing — this is the DB-side
+        duplicate-card guard. The draft flow claims while still ``drafted``
+        (claim-before-send); the legacy recovery flow claims while
+        ``pending_approval``.
+
+        Returns the updated row, or None when the CAS did not apply.
+        """
+        account_key = self._require_account_key()
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 1
+        ):
+            raise ValueError("candidate id must be a positive integer")
+        ts = sent_at or self._utc_now()
+        body: dict[str, Any] = {
+            "approval_sent_at": ts,
+            "updated_at": self._utc_now(),
+        }
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{candidate_id}",
+                "target_account_id": f"eq.{account_key}",
+                "status": "in.(pending_approval,drafted)",
+                "approval_sent_at": "is.null",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        row: dict[str, Any] | None = None
+        for r in rows:
+            if isinstance(r, dict) and r.get("target_account_id") == account_key:
+                row = r
+                break
+        if row is None:
+            return None
+        if approval_ref:
+            self._merge_trend_candidate_approval_ref(
+                candidate_id=candidate_id,
+                account_key=account_key,
+                approval_ref=approval_ref,
+            )
+        return row
+
+    def _merge_trend_candidate_approval_ref(
+        self,
+        *,
+        candidate_id: int,
+        account_key: str,
+        approval_ref: str,
+    ) -> None:
+        """Best-effort merge of the Telegram message ref into raw_metadata."""
+        now = self._utc_now()
+        for _ in range(3):
+            response = self.client.get(
+                f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+                headers=self._headers,
+                params={
+                    "select": "id,status,approval_sent_at,raw_metadata",
+                    "id": f"eq.{candidate_id}",
+                    "target_account_id": f"eq.{account_key}",
+                },
+            )
+            response.raise_for_status()
+            rows = response.json() or []
+            current = next((r for r in rows if isinstance(r, dict)), None)
+            if current is None:
+                return
+            if current.get("status") != "pending_approval":
+                return
+            raw_metadata = dict(current.get("raw_metadata") or {})
+            wa = dict(raw_metadata.get("workflow_a") or {})
+            if wa.get("approval_ref") == approval_ref:
+                return
+            wa["approval_ref"] = approval_ref
+            wa["approval_message"] = approval_ref
+            raw_metadata["workflow_a"] = wa
+            patch = self.client.patch(
+                f"{self.base_url}/rest/v1/{TREND_CANDIDATES_TABLE}",
+                headers=self._headers,
+                params={
+                    "id": f"eq.{candidate_id}",
+                    "target_account_id": f"eq.{account_key}",
+                    "status": "eq.pending_approval",
+                },
+                json={"raw_metadata": raw_metadata, "updated_at": now},
+            )
+            if patch.status_code in (200, 204):
+                return
+            patch.raise_for_status()
+
     def find_stale_pending_approvals(
         self,
         *,
@@ -995,7 +1106,12 @@ class SupabaseStore:
     ) -> list[dict[str, Any]]:
         """SELECT pending_approval rows whose approval card was sent > cutoff.
 
-        Rows with ``approval_sent_at IS NULL`` fall back to ``updated_at``.
+        STRICT RULE: a row is only stale when ``approval_sent_at IS NOT NULL``
+        and older than the cutoff. Rows with ``approval_sent_at IS NULL`` have
+        never had a confirmed Telegram delivery, so they must NEVER time out
+        into backlog (the old ``updated_at`` fallback moved undelivered rows
+        and was removed on purpose).
+
         The caller must CAS each row through
         :meth:`transition_trend_candidate_backlog` before treating it as
         timed out — this read is only a hint, not the actual transition.
@@ -1010,8 +1126,8 @@ class SupabaseStore:
             "select": "id,status,approval_sent_at,updated_at",
             "target_account_id": f"eq.{account_key}",
             "status": "eq.pending_approval",
-            "or": f"(approval_sent_at.lt.{cutoff},and(approval_sent_at.is.null,updated_at.lt.{cutoff}))",
-            "order": "approval_sent_at.asc.nullsfirst,updated_at.asc",
+            "approval_sent_at": f"lt.{cutoff}",
+            "order": "approval_sent_at.asc",
             "limit": str(limit),
         }
         response = self.client.get(

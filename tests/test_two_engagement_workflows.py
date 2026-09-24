@@ -8,6 +8,7 @@ network or credentials are needed.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 from unittest.mock import patch
 
@@ -61,6 +62,21 @@ class FakePostgREST:
             elif raw.startswith("in.("):
                 options = raw[4:-1].split(",")
                 if str(row.get(key)) not in options:
+                    return False
+            elif raw.startswith("lt."):
+                cutoff = raw[3:]
+                actual = row.get(key)
+                if actual is None:
+                    return False
+                actual_dt = datetime.fromisoformat(str(actual).replace("Z", "+00:00"))
+                cutoff_dt = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+                if actual_dt >= cutoff_dt:
+                    return False
+            elif raw.startswith("is.null"):
+                if row.get(key) is not None:
+                    return False
+            elif raw == "not.is.null":
+                if row.get(key) is None:
                     return False
         return True
 

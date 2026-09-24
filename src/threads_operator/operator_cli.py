@@ -5,6 +5,8 @@ import argparse
 import json
 import logging
 import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 import sys
 from collections.abc import Mapping
@@ -247,6 +249,16 @@ def _parser() -> argparse.ArgumentParser:
     trendeng_timeout.add_argument("--account")
     trendeng_timeout.add_argument("--older-than-hours", type=int, default=24)
     trendeng_timeout.add_argument("--dry-run", action="store_true")
+
+    trendeng_telegram_send = trendeng_sub.add_parser(
+        "telegram-send",
+        help="Send one Telegram approval card for a pending_approval candidate "
+             "that has no approval_sent_at yet (legacy recovery)",
+    )
+    trendeng_telegram_send.add_argument("--account")
+    trendeng_telegram_send.add_argument("--id", type=int, required=True)
+    trendeng_telegram_send.add_argument("--card", default=None,
+                                        help="pre-rendered card text; recomputed from stored draft when omitted")
 
     trendeng_use = trendeng_sub.add_parser(
         "use", help="Enqueue one backlog item into the publish queue"
@@ -843,6 +855,55 @@ def _personas_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "personas"
 
 
+def _send_trend_approval_card(
+    *,
+    token: str,
+    chat_id: str,
+    candidate_id: int,
+    card: str,
+) -> str | None:
+    """Send one Telegram approval card for a trend candidate.
+
+    Returns ``"<chat_id>:<message_id>"`` on confirmed delivery, else None.
+    Raises on HTTP/network failure so the caller can keep the row retryable.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": card,
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {"text": "Approve", "callback_data": f"trendeng:approve:{candidate_id}"},
+                    {"text": "Edit", "callback_data": f"trendeng:edit:{candidate_id}"},
+                ],
+                [
+                    {"text": "Reject", "callback_data": f"trendeng:reject:{candidate_id}"},
+                    {"text": "Skip", "callback_data": f"trendeng:skip:{candidate_id}"},
+                ],
+            ]
+        },
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    if not body.get("ok"):
+        desc = body.get("description") or "unknown telegram error"
+        raise RuntimeError(f"telegram api not ok: {desc}")
+    result = body.get("result") or {}
+    message_id = result.get("message_id")
+    if message_id is None:
+        return None
+    chat = result.get("chat") or {}
+    return f"{chat.get('id') or chat_id}:{message_id}"
+
+
 def _run_trendeng_draft(
     config: AccountConfig,
     *,
@@ -911,17 +972,91 @@ def _run_trendeng_draft(
             if from_status not in ("discovered", "drafted"):
                 errors.append({"id": cid, "error": f"unexpected status {from_status}"})
                 continue
-            updated = store.transition_trend_candidate(
-                candidate_id=cid,
-                from_status=from_status,
-                to_status="pending_approval",
-                fields={k: v for k, v in fields.items() if k != "status"},
-            )
-            if updated is None:
+            telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+            telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+            telegram_mode = bool(telegram_token and telegram_chat)
+            card_body = trend_engagement.card_text(candidate, proposal)
+            if not telegram_mode:
+                # No Telegram creds: persist the draft but DO NOT start the
+                # approval timer. discovered -> drafted keeps the row retryable;
+                # drafted -> drafted CAS will not match, so refresh fields directly.
+                if from_status == "discovered":
+                    updated = store.transition_trend_candidate(
+                        candidate_id=cid,
+                        from_status="discovered",
+                        to_status="drafted",
+                        fields={k: v for k, v in fields.items() if k != "status"},
+                    )
+                else:
+                    updated = store.update_trend_candidate_workflow_a(
+                        candidate_id=cid,
+                        fields={k: v for k, v in fields.items() if k != "status"},
+                    )
+                if updated is None:
+                    errors.append({"id": cid, "error": "status precondition failed (already moved)"})
+                    continue
+                drafted.append({"id": cid, **proposal, "card": card_body,
+                                "status": "drafted",
+                                "note": "telegram creds missing; card not sent"})
+                continue
+            # 1. Persist draft fields while the row stays discovered/drafted.
+            if from_status == "discovered":
+                staged = store.transition_trend_candidate(
+                    candidate_id=cid,
+                    from_status="discovered",
+                    to_status="drafted",
+                    fields={k: v for k, v in fields.items() if k != "status"},
+                )
+            else:
+                staged = store.update_trend_candidate_workflow_a(
+                    candidate_id=cid,
+                    fields={k: v for k, v in fields.items() if k != "status"},
+                )
+            if staged is None:
                 errors.append({"id": cid, "error": "status precondition failed (already moved)"})
                 continue
-            drafted.append({"id": cid, **proposal,
-                            "card": trend_engagement.card_text(updated, proposal)})
+            # 2. Claim approval_sent_at BEFORE sending. Only the worker that
+            #    wins this CAS may send a card — duplicates are impossible.
+            claimed = store.mark_trend_candidate_approval_sent(candidate_id=cid)
+            if claimed is None:
+                errors.append({"id": cid, "error": "approval claim lost to concurrent worker; card not sent"})
+                continue
+            # 3. Send the card; on failure release the claim so it stays retryable.
+            try:
+                message_ref = _send_trend_approval_card(
+                    token=telegram_token,
+                    chat_id=telegram_chat,
+                    candidate_id=cid,
+                    card=card_body,
+                )
+            except Exception as exc:  # noqa: BLE001 - one candidate must not kill the batch
+                store.update_trend_candidate_workflow_a(
+                    candidate_id=cid, fields={"approval_sent_at": None},
+                )
+                errors.append({"id": cid, "error": f"telegram send failed: {type(exc).__name__}: {exc}"})
+                continue
+            # 4. Card delivered: promote drafted -> pending_approval and carry
+            #    the stamped approval_sent_at + message ref forward.
+            sent_at = claimed.get("approval_sent_at")
+            promoted = store.transition_trend_candidate(
+                candidate_id=cid,
+                from_status="drafted",
+                to_status="pending_approval",
+                fields={"approval_sent_at": sent_at},
+            )
+            if promoted is None:
+                errors.append({"id": cid, "error": "promotion to pending_approval failed after card delivery"})
+                continue
+            if message_ref:
+                store._merge_trend_candidate_approval_ref(
+                    candidate_id=cid,
+                    account_key=config.name,
+                    approval_ref=message_ref,
+                )
+            drafted.append({**({"id": cid, "telegram_message_ref": message_ref} if message_ref else {"id": cid}),
+                            **proposal,
+                            "approval_sent_at": sent_at,
+                            "card": card_body})
         except Exception as exc:  # noqa: BLE001 - one candidate must not kill the batch
             errors.append({"id": cid, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -935,6 +1070,7 @@ def _run_trendeng_draft(
         "drafted": drafted,
         "skipped": skipped,
         "errors": errors,
+        "telegram_sent": bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")),
     }
 
 
@@ -1138,6 +1274,108 @@ def _run_trendeng_timeout(
         "account": config.name,
         "moved_to_backlog": moved,
         "errors": errors,
+    }
+
+
+def _run_trendeng_telegram_send(
+    config: AccountConfig, *, candidate_id: int, card: str | None
+) -> tuple[int, dict[str, Any]]:
+    """Deliver one approval card for a pending_approval row that has no
+    approval_sent_at yet (legacy recovery), then stamp approval_sent_at.
+
+    Idempotent: rows with a non-null approval_sent_at return ok=True with
+    skipped=True without re-sending, so repeat watchdog runs cannot produce
+    duplicate cards.
+    """
+    from . import trend_engagement
+
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate {candidate_id} not found for this account",
+        }
+    if candidate.get("status") != "pending_approval":
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": f"candidate {candidate_id} is {candidate.get('status')}, not pending_approval",
+        }
+    if candidate.get("approval_sent_at"):
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "candidate_id": candidate_id,
+            "skipped": True,
+            "reason": "approval_sent_at already set; duplicate card prevented",
+        }
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not (telegram_token and telegram_chat):
+        return 2, {
+            "ok": False,
+            "account": config.name,
+            "error": "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set",
+        }
+    card_body = card
+    if not card_body:
+        wa = (candidate.get("raw_metadata") or {}).get("workflow_a") or {}
+        relevance = wa.get("relevance_score")
+        if relevance is None:
+            relevance = candidate.get("trend_score")
+        if relevance is None:
+            relevance = 0.0
+        proposal = {
+            "draft_text": wa.get("draft_text") or "",
+            "topic": wa.get("topic") or candidate.get("topic"),
+            "reason": wa.get("reason") or candidate.get("why_it_works"),
+            "angle": wa.get("angle") or candidate.get("adaptation_angle"),
+            "relevance_score": relevance,
+        }
+        card_body = trend_engagement.card_text(candidate, proposal)
+    # Claim BEFORE sending: the CAS on approval_sent_at IS NULL is the single
+    # guarantee that no second worker/watchdog run can send a duplicate card.
+    claimed = store.mark_trend_candidate_approval_sent(candidate_id=candidate_id)
+    if claimed is None:
+        return 0, {
+            "ok": True,
+            "account": config.name,
+            "candidate_id": candidate_id,
+            "skipped": True,
+            "reason": "approval_sent_at claimed concurrently; duplicate card prevented",
+        }
+    try:
+        message_ref = _send_trend_approval_card(
+            token=telegram_token,
+            chat_id=telegram_chat,
+            candidate_id=candidate_id,
+            card=card_body,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Send failed AFTER the claim: release the stamp so a later run can retry.
+        store.update_trend_candidate_workflow_a(
+            candidate_id=candidate_id, fields={"approval_sent_at": None},
+        )
+        return 1, {
+            "ok": False,
+            "account": config.name,
+            "candidate_id": candidate_id,
+            "error": f"telegram send failed: {type(exc).__name__}: {exc}",
+        }
+    if message_ref:
+        store._merge_trend_candidate_approval_ref(
+            candidate_id=candidate_id,
+            account_key=config.name,
+            approval_ref=message_ref,
+        )
+    return 0, {
+        "ok": True,
+        "account": config.name,
+        "candidate_id": candidate_id,
+        "telegram_message_ref": message_ref,
+        "approval_sent_at": claimed.get("approval_sent_at"),
     }
 
 
@@ -1646,6 +1884,10 @@ def main(
         elif args.command == "trend-engagement" and args.trendeng_command == "timeout":
             code, payload = _run_trendeng_timeout(
                 config, older_than_hours=args.older_than_hours, dry_run=args.dry_run
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "telegram-send":
+            code, payload = _run_trendeng_telegram_send(
+                config, candidate_id=args.id, card=args.card
             )
         elif args.command == "trend-engagement" and args.trendeng_command == "use":
             code, payload = _run_trendeng_use(config, candidate_id=args.id)
