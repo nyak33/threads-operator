@@ -221,3 +221,12 @@ def test_publish_text_retries_meta_media_not_found_race():
 
     assert post_id == "post-1"
     assert calls == {"create": 1, "publish": 2}
+
+
+def test_create_text_container_rejects_overlong_text_before_http_request():
+    def handler(request):
+        raise AssertionError("HTTP must not be called for invalid content")
+
+    api = ThreadsAPI("token", "user-123", client=make_client(handler))
+    with pytest.raises(ValueError, match=r"501/500 characters"):
+        api.create_text_container("x" * 501)
