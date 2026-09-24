@@ -29,13 +29,14 @@ Only flows that exist today are shown. LLM content generation itself is **not** 
 
 ## Current Capabilities
 
-All items below are verified against code and the running VPS (see `docs/fresh-install-verification.md` and the test suite, 557 passed / 1 skipped).
+All items below are verified against code and the running VPS (see `docs/fresh-install-verification.md` and the current test suite/CI).
 
 ### Content Management
 - Account-scoped publish queue (`threads_publish_queue`, default; overridable per account).
 - Draft ingress via `enqueue-draft` — never auto-promotes; human/upstream approval moves rows to `approved`.
 - Per-row **topic** → published as Meta `topic_tag` on the root post (1 topic/post, normalized to Meta rules); survives retries/requeues.
 - Main post + optional follow-up replies in one queue row; the main post ID is persisted before replies are attempted.
+- Platform content guardrails: standard root/reply text is limited to 500 characters; supported draft ingress validates the whole chain before storing it, and the Threads API boundary validates every individual publish call. Long-text attachments are a separate unsupported path; see `docs/threads-platform-rules.md`.
 
 ### Publishing
 - Scheduled publishing: only `status=approved` rows due by `scheduled_at` are claimed, with a conditional claim (lost claim never publishes).
@@ -175,6 +176,7 @@ Everything under "Current Capabilities" above — verified in code and on the ru
 - [`docs/repo-reconciliation.md`](docs/repo-reconciliation.md) — Part 1–7 audit: branches, VPS-vs-repo artifacts, Supabase schema reconciliation.
 - [`docs/fresh-install-verification.md`](docs/fresh-install-verification.md) — Part 22 clean-room results.
 - [`docs/superpowers-pilot.md`](docs/superpowers-pilot.md) — Superpowers pilot task record.
+- [`docs/threads-platform-rules.md`](docs/threads-platform-rules.md) — current Threads character limits, chain-writing rules, official sources, and re-verification policy.
 - [`docs/two-engagement-workflows.md`](docs/two-engagement-workflows.md), [`docs/hermes-engagement-approval.md`](docs/hermes-engagement-approval.md), [`docs/hermes-trend-discovery.md`](docs/hermes-trend-discovery.md), [`docs/hermes-content-generation.md`](docs/hermes-content-generation.md), [`docs/publish-queue-worker.md`](docs/publish-queue-worker.md), [`docs/activity-follow-collector.md`](docs/activity-follow-collector.md) — subsystem designs.
 
 ## Safety
