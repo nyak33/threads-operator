@@ -30,7 +30,7 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 
 - Repository reconciliation audited and recorded in `docs/repo-reconciliation.md` (branches classified; VPS-only runtime artifacts categorized A–F).
 - Category A runtime code ported into `scripts/`: insights collector wrapper, activity collector wrapper, stale-claim watchdog, trend-engagement watchdog, own-replies watchdog, trend approval-timeout watchdog, publish alerts, rollup rebuild.
-- Supabase schema reconciliation: 9 production `threads_*` tables had no creating migration; `migrations/013_missing_base_tables_reconcile.sql` recreates the 6 operator-relevant ones from verified evidence (apply BEFORE 010–012 on a fresh project). `migrations/002_post_daily_rollups.sql` consolidated and marked NOT YET APPLIED to production.
+- Supabase schema reconciliation: 9 production `threads_*` tables had no creating migration; `migrations/013_missing_base_tables_reconcile.sql` recreates the 6 operator-relevant ones from verified evidence (apply BEFORE 010–012 on a fresh project). `migrations/002_post_daily_rollups.sql` consolidated into a single file and **applied to production** (externally verified 2026-09-23: table exists, RLS on, expected indexes present).
 - Machine dependencies removed: `/home/admin` literals eliminated from `src/`/`scripts/`; hardcoded Telegram chat-id fallback removed from publish alerts (alerts no-op when unconfigured); repo-root override renamed `THREADS_OPERATOR_REPO`.
 - `scripts/doctor.sh`: single PASS/WARN/FAIL diagnostic (Python, package, account config, live Supabase connectivity + 12-table schema probe, Telegram, Hermes env/cron, runtime dirs). Verified live (11 pass / 1 warn / 0 fail) and in clean room (correct FAIL modes).
 - `scripts/install_jobs.sh` + `config/runtime-jobs.json` + `config/trend-discovery-prompt.md.tmpl`: declarative, idempotent runtime-job install/converge/remove for the 7 Hermes cron jobs; dry-run and status modes; verified against the live store (7/7 present).
@@ -42,7 +42,7 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 
 1. ~~Apply `migrations/002_post_daily_rollups.sql` to production Supabase~~ — DONE (externally verified 2026-09-23; table exists, RLS on, PK/indexes present; `rebuild_rollups.py` blocker cleared).
 2. ~~Apply `migrations/014_fresh_schema_security_reconcile.sql` to production Supabase + re-replay the full chain incl. 014 on the throwaway project~~ — DONE (externally verified 2026-09-23: production 014 applied and recorded in migration history, all 7 tables RLS-enabled with service_role policies and zero anon/authenticated grants, `threads_own_reply_engagement` error cleared; throwaway re-replay of `013→014` passed, 014 idempotent, Security Advisor ERROR cleared).
-3. Reconcile/retire old remote branches per `docs/repo-reconciliation.md` classifications (user sign-off required before deletion).
+3. ~~Reconcile/retire old remote branches per `docs/repo-reconciliation.md` classifications~~ — DONE (2026-09-24: obsolete fix/feat branches deleted local + remote; remaining refs are `main` + 3 intentional `backup/*`; one worktree, no stashes).
 4. ~~Fresh-VPS end-to-end run including a throwaway Supabase project replay of all migrations incl. 014~~ — DONE (see `docs/fresh-install-verification.md`; only live-posting/browser steps remain deliberately out of scope).
 5. Multi-account hardening soak (per-account failure isolation under simultaneous operation).
 

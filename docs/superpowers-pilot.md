@@ -1,8 +1,10 @@
-# Superpowers Pilot — Real Pilot Task #1
+# Superpowers Pilot — Real Pilot Task #1 — COMPLETE (2026-09-24)
 
 **Task:** Threads Operator — repository reconciliation + product documentation + plug-and-play roadmap.
-**Branch:** `feat/plug-and-play-hardening`
+**Branch:** `feat/plug-and-play-hardening` (merged to main as `85b4eb5`; branch since cleaned up)
 **Date:** 2026-09-23
+
+> **Final status (2026-09-24):** All Supabase migration actions closed — `002_post_daily_rollups` and `014_fresh_schema_security_reconcile` both applied to production and externally verified; full chain replayable from zero on a fresh project. Branch/worktree/stash cleanup signed off and executed. Canonical state: main `7a424f0`, clean tree, 598 passed / 1 skipped, doctor healthy, 7/7 runtime jobs healthy.
 
 This is the first real (non-synthetic) task executed under the Superpowers workflow. Record per the pilot requirement: what Superpowers materially improved, where it added ceremony, and the verification outcome.
 
@@ -53,7 +55,7 @@ This is the first real (non-synthetic) task executed under the Superpowers workf
   1. ~~Apply `migrations/002_post_daily_rollups.sql` to production~~ — DONE (user, 2026-09-23; blocker cleared).
   2. ~~Provide a throwaway Supabase project for the full migration replay~~ — DONE (user, 2026-09-23; replay executed, surfaced the RLS defect).
   3. ~~Apply `migrations/014_fresh_schema_security_reconcile.sql` to production + re-replay the chain incl. 014 on the throwaway project to confirm the Security Advisor ERROR clears~~ — DONE (user, 2026-09-23; both verified, ERROR cleared, 014 idempotent and recorded in production migration history).
-  4. Sign off on old remote branch/worktree/stash deletions (irreversible Git action — correctly gated; still pending).
+  4. ~~Sign off on old remote branch/worktree/stash deletions~~ — DONE (user sign-off received; cleanup executed 2026-09-24 — obsolete fix/feat branches deleted, one worktree, no stashes, only `main` + 3 intentional `backup/*` refs remain).
 
 ## Scope discipline
 
@@ -67,4 +69,4 @@ This is the first real (non-synthetic) task executed under the Superpowers workf
 - Live doctor: 11 pass / 1 warn / 0 fail (the warn was the pending 002 — now resolved in production).
 - Runtime jobs: 7/7 present in the live Hermes store and matching the manifest.
 - External migration replay (user): 14/14 applied + idempotency re-run zero errors; surfaced the fresh-install RLS defect → remediated with 014. **014 re-replay verified (2026-09-23):** full chain `013→014` from zero on the throwaway project passed, 014 idempotent, Security Advisor ERROR cleared; 014 also applied to production and recorded in migration history.
-- **Not declared complete on push.** All Supabase migration actions are now closed. Remaining: user sign-off for branch/worktree/stash cleanup. Plug-and-play status: **READY**.
+- **Task COMPLETE (2026-09-24).** All Supabase migration actions are closed (002 and 014 applied to production and externally verified). Branch/worktree/stash cleanup signed off and executed 2026-09-24. Canonical state: main `7a424f0` (== `origin/main`), clean working tree, 598 passed / 1 skipped, doctor healthy, 7/7 runtime jobs healthy, one worktree, no stashes. Plug-and-play status: **READY**.

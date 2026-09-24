@@ -250,7 +250,7 @@ verifies, and says so in its header.
 | `threads_content_queue` | **NO** | none (legacy scheduler; `topic.py` maps defensively) | documented external dependency |
 | `threads_outbound_replies` | **NO** | affiliate/lead pipeline (legacy) | documented external dependency |
 | `threads_leads` | **NO** | affiliate/lead pipeline (legacy) | documented external dependency |
-| `threads_post_daily_rollups` | **ABSENT FROM PRODUCTION** | written by `rebuild_rollups.py` | **USER: apply 002 in SQL Editor** |
+| `threads_post_daily_rollups` | 002 | written by `rebuild_rollups.py` | covered — 002 applied to production (externally verified 2026-09-23: table exists, RLS on, indexes present) |
 
 Non-threads tables in the same project (`hadith_content_queue`,
 `note_to_self_queue`, `affiliate_queue`, `affiliate_products`) belong to other
@@ -258,8 +258,7 @@ pipelines and are out of scope.
 
 ### User actions required (no programmatic DDL)
 
-1. Apply `migrations/002_post_daily_rollups.sql` in Supabase SQL Editor
-   (creates the missing `threads_post_daily_rollups`).
+1. ~~Apply `migrations/002_post_daily_rollups.sql` in Supabase SQL Editor~~ — DONE (user, 2026-09-23; `threads_post_daily_rollups` exists in production with RLS enabled and expected indexes present; `rebuild_rollups.py` blocker cleared).
 2. Decide whether the fresh-install reproducibility of `threads_content_queue`
    / `threads_outbound_replies` / `threads_leads` matters; if yes, they can be
    added to a future 014 from the same OpenAPI evidence (columns/types already
