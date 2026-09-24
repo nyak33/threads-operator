@@ -13,7 +13,7 @@ Threads Operator currently publishes through the standard Threads `TEXT` API pat
 - **Each reply in a chain:** maximum **500 characters** independently.
 - **Long-text attachments:** Threads supports a separate text-attachment feature of up to **10,000 characters**, but Threads Operator does **not** currently create text attachments. Do not treat 10,000 as the normal post/reply limit.
 - **Topic:** use one meaningful content-specific `topic_tag` on the root post when a real topic can be determined.
-- The operator validates the whole root + reply chain before publishing so an oversized later reply cannot leave a partially published thread.
+- Supported draft ingress validates the whole root + reply chain before it is stored, and the Threads API boundary validates every individual publish call.
 
 The code uses Python Unicode character counting (`len(text)`) as a conservative preflight guard. Meta remains the final authority on accepted payloads.
 
@@ -41,7 +41,7 @@ Before `enqueue-draft`:
 - Assign a meaningful topic instead of a generic placeholder when possible.
 - If the draft depends on a newly released Threads feature, verify that Threads Operator actually supports that API capability before using it.
 
-Threads Operator also validates these hard limits at queue ingress, immediately before a queued thread starts publishing, and again at the Threads API boundary.
+Threads Operator validates the entire chain at supported queue ingress and validates each individual root/reply again at the Threads API boundary. Direct database writes that bypass `enqueue-draft` are unsupported and bypass the whole-chain ingress preflight.
 
 ## Staying current
 
