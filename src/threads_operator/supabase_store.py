@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from .content_rules import validate_thread_texts
 from .threads_api import POST_METRICS, has_usable_metrics
 from .trend_urls import normalize_threads_post_url
 
@@ -1360,6 +1361,7 @@ class SupabaseStore:
         replies = list(reply_texts or [])
         if any(not isinstance(reply, str) or not reply.strip() for reply in replies):
             raise ValueError("reply_texts must contain non-empty strings")
+        validate_thread_texts(main_post_text, replies)
 
         payload: dict[str, Any] = {
             "account_key": account_key,
