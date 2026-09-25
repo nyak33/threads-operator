@@ -671,7 +671,7 @@ def test_choose_time_session_then_confirm(tmp_path):
         asyncio.run(disp.handle_callback(data="trendsched:confirm:146", chat_id="79553451",
                                          user_id="79553451", answer=cap.answer))
     assert any(c[0] == "schedule-time" for c in calls)
-    assert any("Scheduled for" in a for a in cap.answered)
+    assert any("Scheduling confirmed" in a for a in cap.answered)
 
 
 def test_choose_time_invalid_input_reprompts(tmp_path):
@@ -719,3 +719,159 @@ def test_cancel_via_text_does_not_schedule(tmp_path):
     assert all(c[0] == "schedule-cancel" for c in calls)
     msgs = cap.answered + [s["text"] or "" for s in cap.sent]
     assert any("will NOT be posted" in m for m in msgs)
+
+
+def test_schedule_best_sends_confirmation_message(tmp_path):
+    """⭐️ Use Best Time -> persisted-row confirmation chat message."""
+    import asyncio
+    from threads_operator import workflow_telegram as wt
+
+    cap = _Capture()
+    disp = _sched_dispatcher(tmp_path / "s.json", cap)
+    calls: list[list[str]] = []
+
+    async def fake_run_cli(argv, group, args, *, cwd, timeout=90):
+        calls.append(args)
+        return 0, {
+            "ok": True, "status": "queued", "queue_id": 501, "queue_status": "approved",
+            "scheduled_at": "2026-09-25T21:45:00+00:00",
+            "schedule_source": "historical", "score": 0.42, "sample_size": 17,
+            "id": 146,
+            "queue_row": {
+                "id": 501,
+                "scheduled_at": "2026-09-25T21:45:00+00:00",
+                "main_post_text": "Draft 146 body",
+            },
+        }
+
+    with patch.object(wt, "_run_cli", side_effect=fake_run_cli):
+        handled = asyncio.run(disp.handle_callback(
+            data="trendsched:best:146", chat_id="79553451",
+            user_id="79553451", answer=cap.answer))
+    assert handled is True
+    assert calls and calls[0][0] == "schedule-best"
+    assert any("Scheduling confirmed" in a for a in cap.answered)
+    msgs = [s["text"] for s in cap.sent if s["text"]]
+    assert len(msgs) == 1
+    text = msgs[0]
+    assert text.startswith("✅ Post scheduled.")
+    assert "Candidate #146" in text
+    assert "Draft 146 body" in text
+    assert "MYT" in text
+    assert "Mode: ⭐️ Best Time" in text
+    assert "Queue ID: #501" in text
+    assert "Approved — waiting for publisher" in text
+    assert "published automatically at the scheduled time" in text
+
+
+def test_schedule_now_sends_confirmation_message(tmp_path):
+    """⚡️ Post Now -> due-now confirmation, no Scheduled line."""
+    import asyncio
+    from threads_operator import workflow_telegram as wt
+
+    cap = _Capture()
+    disp = _sched_dispatcher(tmp_path / "s.json", cap)
+    calls: list[list[str]] = []
+
+    async def fake_run_cli(argv, group, args, *, cwd, timeout=90):
+        calls.append(args)
+        return 0, {
+            "ok": True, "status": "queued", "queue_id": 777, "queue_status": "approved",
+            "scheduled_at": "2026-09-25T10:00:00+00:00",
+            "schedule_source": "now", "id": 146,
+            "queue_row": {
+                "id": 777,
+                "scheduled_at": "2026-09-25T10:00:00+00:00",
+                "main_post_text": "Draft 146 body",
+            },
+        }
+
+    with patch.object(wt, "_run_cli", side_effect=fake_run_cli):
+        handled = asyncio.run(disp.handle_callback(
+            data="trendsched:now:146", chat_id="79553451",
+            user_id="79553451", answer=cap.answer))
+    assert handled is True
+    assert calls and calls[0][0] == "schedule-now"
+    msgs = [s["text"] for s in cap.sent if s["text"]]
+    assert len(msgs) == 1
+    text = msgs[0]
+    assert text.startswith("✅ Post approved for publishing.")
+    assert "Candidate #146" in text
+    assert "Mode: ⚡️ Post Now" in text
+    assert "Queue ID: #777" in text
+    assert "Approved — due now" in text
+    assert "next worker run" in text
+    assert "Scheduled:" not in text
+
+
+def test_choose_time_confirm_sends_confirmation_message(tmp_path):
+    """🕐 Choose Time -> Confirm -> custom-time confirmation from persisted row."""
+    import asyncio
+    from threads_operator import workflow_telegram as wt
+
+    cap = _Capture()
+    disp = _sched_dispatcher(tmp_path / "s.json", cap)
+    calls: list[list[str]] = []
+
+    async def fake_run_cli(argv, group, args, *, cwd, timeout=90):
+        calls.append(args)
+        return 0, {
+            "ok": True, "status": "queued", "queue_id": 880, "queue_status": "approved",
+            "scheduled_at": "2026-09-30T01:30:00+00:00",
+            "schedule_source": "custom", "id": 146,
+            "queue_row": {
+                "id": 880,
+                "scheduled_at": "2026-09-30T01:30:00+00:00",
+                "main_post_text": "Draft 146 body",
+            },
+        }
+
+    with patch.object(wt, "_run_cli", side_effect=fake_run_cli):
+        asyncio.run(disp.handle_callback(
+            data="trendsched:choose:146", chat_id="79553451",
+            user_id="79553451", answer=cap.answer))
+        handled = asyncio.run(disp.handle_text(
+            chat_id="79553451", user_id="79553451", text="tomorrow 8:30pm"))
+        assert handled is True
+        asyncio.run(disp.handle_callback(
+            data="trendsched:confirm:146", chat_id="79553451",
+            user_id="79553451", answer=cap.answer))
+    assert any(c[0] == "schedule-time" for c in calls)
+    msgs = [s["text"] for s in cap.sent if s["text"] and s["text"].startswith("✅ Post scheduled.")]
+    assert len(msgs) == 1
+    text = msgs[0]
+    assert "Candidate #146" in text
+    assert "Mode: 🕐 Custom Time" in text
+    assert "Queue ID: #880" in text
+    assert "Approved — waiting for publisher" in text
+    assert "MYT" in text
+
+
+def test_schedule_best_retry_does_not_repeat_confirmation(tmp_path):
+    """already_queued retry: toast ack, NO duplicate success confirmation message."""
+    import asyncio
+    from threads_operator import workflow_telegram as wt
+
+    cap = _Capture()
+    disp = _sched_dispatcher(tmp_path / "s.json", cap)
+
+    async def fake_run_cli(argv, group, args, *, cwd, timeout=90):
+        return 0, {
+            "ok": True, "status": "queued", "queue_id": 501,
+            "queue_status": "approved",
+            "scheduled_at": "2026-09-25T21:45:00+00:00",
+            "schedule_source": "historical", "already_queued": True, "id": 146,
+            "queue_row": {
+                "id": 501,
+                "scheduled_at": "2026-09-25T21:45:00+00:00",
+                "main_post_text": "Draft 146 body",
+            },
+        }
+
+    with patch.object(wt, "_run_cli", side_effect=fake_run_cli):
+        handled = asyncio.run(disp.handle_callback(
+            data="trendsched:best:146", chat_id="79553451",
+            user_id="79553451", answer=cap.answer))
+    assert handled is True
+    assert any("already scheduled" in a for a in cap.answered)
+    assert all(not (s["text"] or "").startswith("✅ Post") for s in cap.sent)

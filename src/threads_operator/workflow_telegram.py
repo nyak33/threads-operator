@@ -54,6 +54,13 @@ SCHED_CONFIRM_KIND = "trendsched:confirm"
 CANCEL_WORDS = {"cancel"}
 MAX_CHARS = 500
 
+_SCHED_MODE_LABELS = {
+    "historical": "⭐️ Best Time",
+    "fallback": "⭐️ Best Time",
+    "now": "⚡️ Post Now",
+    "custom": "🕐 Custom Time",
+}
+
 
 def parse_prefixed_callback(data: str | None, prefix: str, actions: tuple[str, ...]) -> tuple[str, int] | None:
     if not isinstance(data, str) or not data.startswith(prefix):
@@ -201,6 +208,48 @@ def trendsched_confirm_card_text(candidate_id: int, when_utc_iso: str, draft_pre
         "",
         "Confirm to schedule this post.",
     ])
+
+
+def trendsched_success_message(payload: dict[str, Any]) -> str:
+    """Final confirmation chat message after a scheduling DB commit.
+
+    Renders ONLY from the persisted queue row returned by the CLI
+    (``queue_row``), never from pre-commit session values. Times are shown in
+    MYT. ``scheduled_at`` is omitted for ⚡️ Post Now (due immediately).
+    """
+    cid = payload.get("id")
+    row = payload.get("queue_row") or {}
+    source = str(payload.get("schedule_source") or "")
+    mode = _SCHED_MODE_LABELS.get(source, "✅ Scheduled")
+    post = str(row.get("main_post_text") or "").strip()
+    preview = post if len(post) <= 200 else post[:197] + "..."
+    qid = row.get("id") or payload.get("queue_id")
+    if source == "now":
+        lines = [
+            "✅ Post approved for publishing.",
+            "",
+            f"Candidate #{cid}",
+            f"Post:\n{preview}",
+            f"Mode: {mode}",
+            f"Queue ID: #{qid}",
+            "Status: Approved — due now",
+            "",
+            "The normal publisher will publish it on the next worker run.",
+        ]
+    else:
+        lines = [
+            "✅ Post scheduled.",
+            "",
+            f"Candidate #{cid}",
+            f"Post:\n{preview}",
+            f"Scheduled: {_fmt_myt(row.get('scheduled_at') or payload.get('scheduled_at'))}",
+            f"Mode: {mode}",
+            f"Queue ID: #{qid}",
+            "Status: Approved — waiting for publisher",
+            "",
+            "The post will be published automatically at the scheduled time.",
+        ]
+    return "\n".join(lines)
 
 
 async def _run_cli(
@@ -625,23 +674,18 @@ class TrendSchedDispatcher(_BaseWorkflowDispatcher):
         if code != 0 or not payload.get("ok"):
             await self._answer(answer, f"❌ Scheduling failed: {_err(payload)}")
             return
-        when = _fmt_myt(payload.get("scheduled_at"))
-        qid = payload.get("queue_id")
-        source = payload.get("schedule_source")
         if payload.get("already_queued"):
-            note = f"✅ #{cid}: already scheduled for {when} (queue #{qid})."
-        elif source == "historical":
-            note = (f"⭐️ Scheduled at best time: {when}\n(queue #{qid}, "
-                    f"score={payload.get('score', 0):.3f}, n={payload.get('sample_size', 0)})")
-        elif source == "fallback":
-            note = f"⭐️ Scheduled at {when} (queue #{qid}) — configured fallback window."
-        elif source == "now":
-            note = f"⚡️ Queued to post now (queue #{qid}). Publisher picks it up on the next run."
-        elif source == "custom":
-            note = f"🕐 Scheduled for {when} (queue #{qid})."
-        else:
-            note = f"✅ Scheduled for {when} (queue #{qid})."
-        await self._answer(answer, note)
+            # Idempotent retry: the queue row was committed earlier. Acknowledge
+            # via the toast but do NOT repeat the success confirmation message.
+            await self._answer(
+                answer,
+                f"✅ #{cid}: already scheduled for "
+                f"{_fmt_myt(payload.get('scheduled_at'))} "
+                f"(queue #{payload.get('queue_id')}).",
+            )
+            return
+        await self._answer(answer, "✅ Scheduling confirmed.")
+        await self._send(str(chat_id), trendsched_success_message(payload))
 
     async def _start_choose(
         self, cid: int, *, chat_id: str, user_id: str, answer: AnswerFn | None
@@ -683,11 +727,16 @@ class TrendSchedDispatcher(_BaseWorkflowDispatcher):
         if code != 0 or not payload.get("ok"):
             await self._answer(answer, f"❌ Scheduling failed: {_err(payload)}")
             return
-        await self._answer(
-            answer,
-            f"🕐 Scheduled for {_fmt_myt(payload.get('scheduled_at'))} "
-            f"(queue #{payload.get('queue_id')}).",
-        )
+        if payload.get("already_queued"):
+            await self._answer(
+                answer,
+                f"✅ #{cid}: already scheduled for "
+                f"{_fmt_myt(payload.get('scheduled_at'))} "
+                f"(queue #{payload.get('queue_id')}).",
+            )
+            return
+        await self._answer(answer, "✅ Scheduling confirmed.")
+        await self._send(str(chat_id), trendsched_success_message(payload))
 
     async def _run_cancel(
         self, cid: int, *, chat_id: str, user_id: str, answer: AnswerFn | None

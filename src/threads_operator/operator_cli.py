@@ -1313,6 +1313,7 @@ def _load_schedulable_candidate(
             "status": "queued", "queue_id": qid,
             "queue_status": row.get("status"),
             "scheduled_at": row.get("scheduled_at"),
+            "queue_row": row or None,
             "already_queued": True,
         }
     if candidate.get("status") != "approved":
@@ -1358,13 +1359,13 @@ def _run_trendeng_schedule_best(
     )
     row = _ensure_approved_queue_row(store, config, candidate, scheduled_utc=rec.scheduled_utc)
     status = _finalize_scheduled_candidate(store, candidate_id=candidate_id, queue_id=int(row["id"]))
-    draft, _ = _candidate_draft(candidate)
     return 0, {
         "ok": True, "account": config.name, "id": candidate_id, "status": status,
         "queue_id": row.get("id"), "queue_status": "approved",
-        "scheduled_at": rec.scheduled_utc.isoformat(), "schedule_source": rec.source,
+        "scheduled_at": row.get("scheduled_at") or rec.scheduled_utc.isoformat(),
+        "schedule_source": rec.source,
         "score": rec.score, "sample_size": rec.sample_size, "reason": rec.reason,
-        "draft_preview": draft[:200],
+        "queue_row": row,
     }
 
 
@@ -1382,7 +1383,8 @@ def _run_trendeng_schedule_now(
     return 0, {
         "ok": True, "account": config.name, "id": candidate_id, "status": status,
         "queue_id": row.get("id"), "queue_status": "approved",
-        "scheduled_at": now_utc.isoformat(), "schedule_source": "now",
+        "scheduled_at": row.get("scheduled_at") or now_utc.isoformat(),
+        "schedule_source": "now", "queue_row": row,
     }
 
 
@@ -1402,7 +1404,8 @@ def _run_trendeng_schedule_time(
     return 0, {
         "ok": True, "account": config.name, "id": candidate_id, "status": status,
         "queue_id": row.get("id"), "queue_status": "approved",
-        "scheduled_at": ts.isoformat(), "schedule_source": "custom",
+        "scheduled_at": row.get("scheduled_at") or ts.isoformat(),
+        "schedule_source": "custom", "queue_row": row,
     }
 
 
