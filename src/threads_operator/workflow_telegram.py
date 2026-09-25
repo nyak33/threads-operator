@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -28,17 +29,27 @@ from .engagement_telegram import (
     _err,
     run_engagement_cli,
 )
+from .scheduling import MYT, ScheduleParseError, parse_custom_time
 
 logger = logging.getLogger(__name__)
 
 TRENDENG_PREFIX = "trendeng:"
-TRENDENG_ACTIONS = ("approve", "edit", "reject", "skip")
+TRENDENG_ACTIONS = ("approve", "edit", "reject", "skip", "use")
 
 OWNREPLY_PREFIX = "ownreply:"
 OWNREPLY_ACTIONS = ("approve", "edit", "reject", "ignore")
 
 BACKLOG_PREFIX = "backlog:"
 BACKLOG_ACTIONS = ("use", "edit", "refresh", "discard", "next")
+
+# Smart scheduling (Task #3) — second-step "when to publish" actions.
+TRENDSCHED_PREFIX = "trendsched:"
+TRENDSCHED_ACTIONS = ("best", "now", "choose", "confirm", "cancel")
+
+# Session "kind" markers stored in the PendingEditStore card_message_id field so
+# the generic text interceptor can route them to the right handler.
+SCHED_INPUT_KIND = "trendsched:input"
+SCHED_CONFIRM_KIND = "trendsched:confirm"
 
 CANCEL_WORDS = {"cancel"}
 MAX_CHARS = 500
@@ -127,6 +138,69 @@ def backlog_card_text(item: dict[str, Any]) -> str:
         f"Draft ({len(draft)} chars):\n{preview}",
     ]
     return "\n".join(lines)
+
+
+def trendsched_keyboard(candidate_id: int) -> dict[str, Any]:
+    """Second-step card shown after content approval: *when* to publish."""
+    return {
+        "inline_keyboard": [
+            [{"text": "⭐️ Use Best Time", "callback_data": f"trendsched:best:{candidate_id}"}],
+            [{"text": "⚡️ Post Now", "callback_data": f"trendsched:now:{candidate_id}"}],
+            [{"text": "🕐 Choose Time", "callback_data": f"trendsched:choose:{candidate_id}"}],
+            [{"text": "✖️ Cancel", "callback_data": f"trendsched:cancel:{candidate_id}"}],
+        ]
+    }
+
+
+def trendsched_confirm_keyboard(candidate_id: int) -> dict[str, Any]:
+    """Confirmation card for a custom-entered time."""
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Confirm", "callback_data": f"trendsched:confirm:{candidate_id}"}],
+            [{"text": "🕐 Change Time", "callback_data": f"trendsched:choose:{candidate_id}"}],
+            [{"text": "✖️ Cancel", "callback_data": f"trendsched:cancel:{candidate_id}"}],
+        ]
+    }
+
+
+def _fmt_myt(utc_iso: str | None) -> str:
+    """Render a UTC ISO timestamp as '25 Sep 2026, 9:00 PM MYT'."""
+    if not utc_iso:
+        return "n/a"
+    try:
+        ts = datetime.fromisoformat(str(utc_iso).replace("Z", "+00:00"))
+    except ValueError:
+        return str(utc_iso)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    local = ts.astimezone(MYT)
+    return local.strftime("%d %b %Y, %-I:%M %p MYT")
+
+
+def trendsched_card_text(candidate_id: int, draft_preview: str) -> str:
+    preview = draft_preview if len(draft_preview) <= 200 else draft_preview[:197] + "..."
+    return "\n".join([
+        "✅ Content approved for publication.",
+        "",
+        f"Candidate #{candidate_id}",
+        f"Draft ({len(draft_preview)} chars):\n{preview}",
+        "",
+        "🕐 When should this post be published?",
+    ])
+
+
+def trendsched_confirm_card_text(candidate_id: int, when_utc_iso: str, draft_preview: str) -> str:
+    preview = draft_preview if len(draft_preview) <= 200 else draft_preview[:197] + "..."
+    return "\n".join([
+        "🕐 Confirm schedule",
+        "",
+        f"Candidate #{candidate_id}",
+        f"Post:\n{preview}",
+        "",
+        f"Schedule:\n{_fmt_myt(when_utc_iso)}",
+        "",
+        "Confirm to schedule this post.",
+    ])
 
 
 async def _run_cli(
@@ -334,6 +408,36 @@ class TrendEngagementDispatcher(_BaseWorkflowDispatcher):
     actions = TRENDENG_ACTIONS
     edit_prompt = "Send the new draft text for this trend post, or 'cancel'."
 
+    async def _decide(
+        self, row_id: int, action: str, *, chat_id: str, message_id: str | None, answer: AnswerFn | None
+    ) -> None:
+        # After content approval, ask *when* to publish instead of enqueueing a
+        # draft. The queue row is only created (approved) once a scheduling
+        # option is chosen. Other actions keep the base behavior.
+        if action != "approve":
+            await super()._decide(row_id, action, chat_id=chat_id, message_id=message_id, answer=answer)
+            return
+        ref = f"tg:{chat_id}:{message_id}" if message_id else f"tg:{chat_id}"
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            ["approve", "--account", self.account, "--id", str(row_id), "--approval-ref", ref],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            await self._answer(answer, f"❌ Approve failed: {_err(payload)}")
+            return
+        if payload.get("already_queued"):
+            await self._answer(answer, f"✅ #{row_id}: already scheduled (queue #{payload.get('queue_id')}).")
+            return
+        # Content is approved (or already approved) — prompt for scheduling.
+        preview = str(payload.get("draft_preview") or "").strip() or f"Candidate #{row_id}"
+        await self._answer(answer, f"✅ #{row_id}: content approved.")
+        await self._send(
+            str(chat_id),
+            trendsched_card_text(row_id, preview),
+            markup=trendsched_keyboard(row_id),
+        )
+
 
 class OwnReplyDispatcher(_BaseWorkflowDispatcher):
     """Workflow B: ownreply: callbacks -> own-replies CLI group."""
@@ -393,6 +497,17 @@ class TrendBacklogDispatcher(_BaseWorkflowDispatcher):
                 await self._answer(answer, "This approval expired and was moved to Content Backlog.")
                 return
             await self._answer(answer, f"❌ {action.title()} failed: {err}")
+            return
+
+        if action == "use" and payload.get("needs_scheduling"):
+            # Content approved from backlog — ask when to publish (Task #3).
+            await self._answer(answer, "✅ Content approved.")
+            preview = str(payload.get("draft_preview") or "").strip() or f"Candidate #{row_id}"
+            await self._send(
+                str(chat_id),
+                trendsched_card_text(row_id, preview),
+                markup=trendsched_keyboard(row_id),
+            )
             return
 
         if action == "use":
@@ -461,3 +576,184 @@ class OwnReplyTelegramBridge(OwnReplyDispatcher):
 
 class TrendBacklogTelegramBridge(TrendBacklogDispatcher):
     """Gateway-compatible alias for the Workflow A backlog UX."""
+
+
+class TrendSchedDispatcher(_BaseWorkflowDispatcher):
+    """Smart-scheduling step (Task #3): trendsched: callbacks.
+
+    Shown *after* content approval. Every completed path produces an approved +
+    scheduled publish-queue row via the trend-engagement CLI ``schedule-*``
+    subcommands. Custom-time input is a temporary PendingEditStore session.
+    """
+
+    group = "trend-engagement"
+    prefix = TRENDSCHED_PREFIX
+    actions = TRENDSCHED_ACTIONS
+    edit_prompt = ""  # unused; scheduling uses its own prompts
+
+    async def handle_callback(
+        self,
+        *,
+        data: str,
+        chat_id: str,
+        user_id: str,
+        message_id: str | None = None,
+        answer: AnswerFn | None = None,
+    ) -> bool:
+        parsed = parse_prefixed_callback(data, self.prefix, self.actions)
+        if parsed is None:
+            return False
+        action, cid = parsed
+        if action in ("best", "now"):
+            await self._run_schedule(cid, f"schedule-{action}", chat_id=str(chat_id), answer=answer)
+        elif action == "choose":
+            await self._start_choose(cid, chat_id=str(chat_id), user_id=str(user_id), answer=answer)
+        elif action == "confirm":
+            await self._run_confirm(cid, chat_id=str(chat_id), user_id=str(user_id), answer=answer)
+        elif action == "cancel":
+            await self._run_cancel(cid, chat_id=str(chat_id), user_id=str(user_id), answer=answer)
+        return True
+
+    async def _run_schedule(
+        self, cid: int, sub: str, *, chat_id: str, answer: AnswerFn | None
+    ) -> None:
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            [sub, "--account", self.account, "--id", str(cid)],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            await self._answer(answer, f"❌ Scheduling failed: {_err(payload)}")
+            return
+        when = _fmt_myt(payload.get("scheduled_at"))
+        qid = payload.get("queue_id")
+        source = payload.get("schedule_source")
+        if payload.get("already_queued"):
+            note = f"✅ #{cid}: already scheduled for {when} (queue #{qid})."
+        elif source == "historical":
+            note = (f"⭐️ Scheduled at best time: {when}\n(queue #{qid}, "
+                    f"score={payload.get('score', 0):.3f}, n={payload.get('sample_size', 0)})")
+        elif source == "fallback":
+            note = f"⭐️ Scheduled at {when} (queue #{qid}) — configured fallback window."
+        elif source == "now":
+            note = f"⚡️ Queued to post now (queue #{qid}). Publisher picks it up on the next run."
+        elif source == "custom":
+            note = f"🕐 Scheduled for {when} (queue #{qid})."
+        else:
+            note = f"✅ Scheduled for {when} (queue #{qid})."
+        await self._answer(answer, note)
+
+    async def _start_choose(
+        self, cid: int, *, chat_id: str, user_id: str, answer: AnswerFn | None
+    ) -> None:
+        self.store.create(
+            chat_id=chat_id, user_id=user_id, engagement_id=cid,
+            account_key=self.account, card_message_id=SCHED_INPUT_KIND,
+        )
+        await self._answer(
+            answer,
+            "🕐 Send the time to post (MYT), e.g.:\n"
+            "• 9pm\n• tonight 9pm\n• tomorrow 8:30pm\n• 25 Sep 9pm\n• 2026-09-25 21:00\n\n"
+            "or 'cancel'.",
+        )
+
+    async def _run_confirm(
+        self, cid: int, *, chat_id: str, user_id: str, answer: AnswerFn | None
+    ) -> None:
+        session = self.store.find_for_sender(chat_id=chat_id, user_id=user_id)
+        when = None
+        if session and session.get("card_message_id", "").startswith(
+            SCHED_CONFIRM_KIND + ":"
+        ):
+            when = session["card_message_id"][len(SCHED_CONFIRM_KIND) + 1:]
+        if not when:
+            await self._answer(
+                answer,
+                "⚠️ No pending time to confirm (session may have expired). "
+                "Tap 🕐 Choose Time again.",
+            )
+            return
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            ["schedule-time", "--account", self.account, "--id", str(cid), "--at", when],
+            cwd=self.cwd,
+        )
+        if session:
+            self.store.remove(session["token"])
+        if code != 0 or not payload.get("ok"):
+            await self._answer(answer, f"❌ Scheduling failed: {_err(payload)}")
+            return
+        await self._answer(
+            answer,
+            f"🕐 Scheduled for {_fmt_myt(payload.get('scheduled_at'))} "
+            f"(queue #{payload.get('queue_id')}).",
+        )
+
+    async def _run_cancel(
+        self, cid: int, *, chat_id: str, user_id: str, answer: AnswerFn | None
+    ) -> None:
+        session = self.store.find_for_sender(chat_id=chat_id, user_id=user_id)
+        if session:
+            self.store.remove(session["token"])
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            ["schedule-cancel", "--account", self.account, "--id", str(cid)],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            await self._answer(answer, f"❌ Cancel failed: {_err(payload)}")
+            return
+        await self._answer(
+            answer,
+            f"✖️ Scheduling cancelled for #{cid}. The content is approved but "
+            "will NOT be posted. Re-approve (or use the backlog) to schedule it later.",
+        )
+
+    async def handle_text(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        text: str,
+        answer: AnswerFn | None = None,
+    ) -> bool:
+        """Consume a scheduling session message (custom-time input)."""
+        session = self.store.find_for_sender(chat_id=str(chat_id), user_id=str(user_id))
+        if session is None:
+            return False
+        kind = session.get("card_message_id") or ""
+        if kind != SCHED_INPUT_KIND:
+            return False  # not a scheduling-input session; leave for others
+        cid = int(session["engagement_id"])
+        body = (text or "").strip()
+        if body.lower() in CANCEL_WORDS:
+            self.store.remove(session["token"])
+            await self._run_cancel(cid, chat_id=str(chat_id), user_id=str(user_id), answer=answer)
+            return True
+        try:
+            when = parse_custom_time(body)
+        except ScheduleParseError as exc:
+            logger.info("schedule: custom-time parse failed for #%d: %s (%r)", cid, exc, body)
+            await self._send(
+                str(chat_id),
+                f"⚠️ Couldn't understand that time ({exc}). Try e.g. '9pm', "
+                "'tomorrow 8:30pm', '25 Sep 9pm', or 'cancel'.",
+            )
+            return True
+        when_iso = when.isoformat()
+        # Move the session to a confirm state carrying the parsed timestamp.
+        self.store.remove(session["token"])
+        self.store.create(
+            chat_id=str(chat_id), user_id=str(user_id), engagement_id=cid,
+            account_key=self.account, card_message_id=f"{SCHED_CONFIRM_KIND}:{when_iso}",
+        )
+        await self._send(
+            str(chat_id),
+            trendsched_confirm_card_text(cid, when_iso, f"Candidate #{cid}"),
+            markup=trendsched_confirm_keyboard(cid),
+        )
+        return True
+
+
+class TrendSchedTelegramBridge(TrendSchedDispatcher):
+    """Gateway-compatible alias for the smart-scheduling step."""

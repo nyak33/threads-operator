@@ -1388,6 +1388,136 @@ class SupabaseStore:
             raise ValueError("Draft insert did not return a queue row")
         return rows[0]
 
+    def enqueue_approved(
+        self,
+        table: str,
+        main_post_text: str,
+        reply_texts: list[str] | None = None,
+        campaign_code: str | None = None,
+        *,
+        scheduled_at: str,
+        topic: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert content directly as an *approved* queue row.
+
+        Used by the Telegram approval flow where "Approve" already means the
+        content is approved for publication — the only remaining decision is
+        *when* to post. Unlike :meth:`enqueue_draft`, the row is created with
+        ``status='approved'`` and an explicit ``scheduled_at`` so the existing
+        publish worker picks it up when due, with no intermediate draft state.
+        """
+        if not scheduled_at or not str(scheduled_at).strip():
+            raise ValueError("scheduled_at is required for an approved queue row")
+        account_key = self._require_account_key()
+        if not isinstance(main_post_text, str) or not main_post_text.strip():
+            raise ValueError("main_post_text must not be empty")
+        replies = list(reply_texts or [])
+        if any(not isinstance(reply, str) or not reply.strip() for reply in replies):
+            raise ValueError("reply_texts must contain non-empty strings")
+        validate_thread_texts(main_post_text, replies)
+
+        payload: dict[str, Any] = {
+            "account_key": account_key,
+            "main_post_text": main_post_text,
+            "reply_texts": replies,
+            "status": "approved",
+            "scheduled_at": scheduled_at,
+        }
+        if campaign_code:
+            payload["campaign_code"] = campaign_code
+        if topic and topic.strip():
+            payload["topic"] = topic.strip()
+
+        headers = {**self._headers, "Prefer": "return=representation"}
+        response = self.client.post(
+            self._queue_url(table),
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        if not rows:
+            raise ValueError("Approved insert did not return a queue row")
+        return rows[0]
+
+    def promote_draft_to_approved(
+        self, table: str, row_id: int | str, *, scheduled_at: str
+    ) -> dict[str, Any] | None:
+        """Promote a ``draft`` queue row to ``approved`` + ``scheduled_at``.
+
+        Idempotency guard for the approval flow: if a candidate already has a
+        queue row in draft state (e.g. created by an older enqueue path), reuse
+        and promote it rather than inserting a duplicate. Returns the updated
+        row, or None when the row is no longer in ``draft`` (already promoted /
+        claimed by someone else).
+        """
+        if not scheduled_at or not str(scheduled_at).strip():
+            raise ValueError("scheduled_at is required to promote a queue row")
+        account_key = self._require_account_key()
+        response = self.client.patch(
+            self._queue_url(table),
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{row_id}",
+                "account_key": f"eq.{account_key}",
+                "status": "eq.draft",
+            },
+            json={
+                "status": "approved",
+                "scheduled_at": scheduled_at,
+                "updated_at": self._utc_now(),
+            },
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        return rows[0] if rows else None
+
+    def list_scheduled_queue_rows(
+        self,
+        table: str,
+        *,
+        from_utc: str,
+        statuses: tuple[str, ...] = ("approved", "posting"),
+    ) -> list[dict[str, Any]]:
+        """Return queue rows at/after ``from_utc`` for collision avoidance.
+
+        Only statuses that represent committed future publication are
+        considered (approved/posting) — drafts are unscheduled and ignored.
+        """
+        account_key = self._require_account_key()
+        response = self.client.get(
+            self._queue_url(table),
+            headers=self._headers,
+            params={
+                "account_key": f"eq.{account_key}",
+                "status": f"in.({','.join(statuses)})",
+                "scheduled_at": f"gte.{from_utc}",
+                "select": "id,scheduled_at,status",
+                "order": "scheduled_at.asc",
+                "limit": "500",
+            },
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
+
+    def list_post_insight_rows(
+        self, *, since_utc: str, limit: int = 5000
+    ) -> list[dict[str, Any]]:
+        """Return recent post insight snapshots for historical slot scoring."""
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{POST_TABLE}",
+            headers=self._headers,
+            params={
+                "captured_at": f"gte.{since_utc}",
+                "order": "captured_at.desc",
+                "limit": str(limit),
+                "select": "post_id,captured_at,published_at,post_age_minutes,"
+                          "views,likes,replies,reposts,quotes",
+            },
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
+
     def peek_due_post(
         self,
         table: str,

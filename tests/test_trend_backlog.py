@@ -559,9 +559,12 @@ def test_cli_use_enqueues(store, backend):
         _restore_store(old_store)
     assert code == 0
     assert payload["ok"] is True
-    assert payload["status"] == "queued"
+    # Task #3: "use" now approves content and prompts for scheduling; the queue
+    # row is only created (approved) once a scheduling option is chosen.
+    assert payload["status"] == "approved"
+    assert payload.get("needs_scheduling") is True
     assert payload["topic"] == "digital marketing"
-    assert len(backend.tables["threads_publish_queue"]) == 1
+    assert len(backend.tables["threads_publish_queue"]) == 0
 
 
 def test_cli_use_idempotent(store, backend):
@@ -575,9 +578,10 @@ def test_cli_use_idempotent(store, backend):
         code2, payload2 = _run_trendeng_use(config, candidate_id=row["id"])
     finally:
         _restore_store(old_store)
-    assert code2 == 0
-    assert payload2.get("already_queued") is True
-    assert len(backend.tables["threads_publish_queue"]) == 1
+    # Second use: candidate is no longer backlog (approved), so it is rejected
+    # — and crucially no duplicate queue row is ever created.
+    assert code2 == 2
+    assert len(backend.tables["threads_publish_queue"]) == 0
 
 
 def test_cli_discard(store, backend):

@@ -10,6 +10,7 @@ import urllib.request
 from pathlib import Path
 import sys
 from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .account_config import (
@@ -35,6 +36,11 @@ from .engagement_queue import (
 from .publish_worker import publish_next_with_recovery
 from .publisher import publish_next
 from .safe_errors import redact_error
+from .scheduling import (
+    SchedulingConfig,
+    _parse_ts,
+    recommend_slot,
+)
 from .supabase_store import SupabaseStore, TREND_STATUSES, trend_candidate_payload
 from .threads_api import DEFAULT_BASE_URL, ThreadsAPI
 from .trend_urls import normalize_threads_post_url
@@ -265,6 +271,45 @@ def _parser() -> argparse.ArgumentParser:
     )
     trendeng_use.add_argument("--account")
     trendeng_use.add_argument("--id", type=int, required=True)
+
+    # --- Smart scheduling (Task #3) ---------------------------------------
+    # "Approve" already means the content is approved for publication; these
+    # subcommands only decide *when* to publish, and always produce an
+    # approved + scheduled queue row the existing publish worker can post.
+    trendeng_sched_approve = trendeng_sub.add_parser(
+        "schedule-approve",
+        help="Mark candidate content approved and await a scheduling choice",
+    )
+    trendeng_sched_approve.add_argument("--account")
+    trendeng_sched_approve.add_argument("--id", type=int, required=True)
+
+    trendeng_sched_best = trendeng_sub.add_parser(
+        "schedule-best",
+        help="Pick the best posting time from historical engagement (with fallback)",
+    )
+    trendeng_sched_best.add_argument("--account")
+    trendeng_sched_best.add_argument("--id", type=int, required=True)
+
+    trendeng_sched_now = trendeng_sub.add_parser(
+        "schedule-now", help="Approve the queue row as due immediately"
+    )
+    trendeng_sched_now.add_argument("--account")
+    trendeng_sched_now.add_argument("--id", type=int, required=True)
+
+    trendeng_sched_time = trendeng_sub.add_parser(
+        "schedule-time",
+        help="Approve the queue row for an explicit (UTC ISO) timestamp",
+    )
+    trendeng_sched_time.add_argument("--account")
+    trendeng_sched_time.add_argument("--id", type=int, required=True)
+    trendeng_sched_time.add_argument("--at", required=True, help="UTC ISO timestamp")
+
+    trendeng_sched_cancel = trendeng_sub.add_parser(
+        "schedule-cancel",
+        help="Cancel scheduling; content stays approved and is NOT published",
+    )
+    trendeng_sched_cancel.add_argument("--account")
+    trendeng_sched_cancel.add_argument("--id", type=int, required=True)
 
     trendeng_refresh = trendeng_sub.add_parser(
         "refresh", help="Rewrite one backlog draft with the current LLM"
@@ -1113,35 +1158,321 @@ def _trendeng_set_status(
     return 0, {"ok": True, "account": config.name, "id": candidate_id, "status": to_status}
 
 
-def _run_trendeng_approve(
+# ---------------------------------------------------------------------------
+# Smart scheduling (Task #3)
+#
+# "Approve" already means the content is approved for publication. These
+# helpers only decide *when* to publish and always leave the queue row in the
+# terminal state ``approved`` + ``scheduled_at`` so the existing publish worker
+# picks it up. Idempotency: a candidate's existing ``used_in_queue_id`` is
+# reused (promoted from draft) instead of inserting a duplicate row.
+# ---------------------------------------------------------------------------
+
+
+def _scheduling_config(config: AccountConfig) -> SchedulingConfig:
+    def _int(key: str, default: int) -> int:
+        raw = (config.get(key) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return value if value > 0 else default
+
+    hours_raw = (config.get("THREADS_SCHED_FALLBACK_HOURS") or "").strip()
+    hours = SchedulingConfig().fallback_hours_local
+    if hours_raw:
+        parsed: list[int] = []
+        for part in hours_raw.split(","):
+            part = part.strip()
+            if part.isdigit() and 0 <= int(part) <= 23:
+                parsed.append(int(part))
+        if parsed:
+            hours = tuple(parsed)
+    return SchedulingConfig(
+        min_gap_minutes=_int("THREADS_SCHED_MIN_GAP_MINUTES", 60),
+        min_samples=_int("THREADS_SCHED_MIN_SAMPLES", 2),
+        lookahead_days=_int("THREADS_SCHED_LOOKAHEAD_DAYS", 7),
+        min_lead_minutes=_int("THREADS_SCHED_MIN_LEAD_MINUTES", 5),
+        fallback_hours_local=hours,
+        history_window_days=_int("THREADS_SCHED_HISTORY_WINDOW_DAYS", 90),
+    )
+
+
+def _candidate_draft(candidate: dict[str, Any]) -> tuple[str, str | None]:
+    wa = (candidate.get("raw_metadata") or {}).get("workflow_a") or {}
+    draft = (wa.get("draft_text") or "").strip()
+    topic = (candidate.get("topic") or wa.get("topic") or "").strip() or None
+    return draft, topic
+
+
+def _ensure_approved_queue_row(
+    store: SupabaseStore,
+    config: AccountConfig,
+    candidate: dict[str, Any],
+    *,
+    scheduled_utc,
+) -> dict[str, Any]:
+    """Return an approved + scheduled queue row for ``candidate``.
+
+    Reuses (promotes) an existing draft queue row referenced by
+    ``used_in_queue_id``; otherwise inserts a fresh approved row. Never returns
+    a draft — callers can rely on the row being publishable.
+    """
+    scheduled_at = scheduled_utc.isoformat()
+    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+    campaign = config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
+
+    existing_id = candidate.get("used_in_queue_id")
+    if existing_id:
+        promoted = store.promote_draft_to_approved(table, existing_id, scheduled_at=scheduled_at)
+        if promoted is not None:
+            logger.info(
+                "schedule: promoted existing queue row #%s to approved @ %s",
+                existing_id, scheduled_at,
+            )
+            return promoted
+        current = store.fetch_queue_row(table, existing_id)
+        if current and current.get("status") == "approved":
+            store._patch_queue_row(table, existing_id, {"scheduled_at": scheduled_at})
+            current["scheduled_at"] = scheduled_at
+            logger.info("schedule: reused approved queue row #%s", existing_id)
+            return current
+        # Row was posted/failed/missing — fall through and create a fresh row.
+        logger.info(
+            "schedule: linked queue row #%s not reusable (status=%s); creating new",
+            existing_id, (current or {}).get("status"),
+        )
+
+    draft, topic = _candidate_draft(candidate)
+    row = store.enqueue_approved(
+        table, draft, reply_texts=[], campaign_code=campaign,
+        scheduled_at=scheduled_at, topic=topic,
+    )
+    logger.info("schedule: created approved queue row #%s @ %s", row.get("id"), scheduled_at)
+    return row
+
+
+def _finalize_scheduled_candidate(
+    store: SupabaseStore, *, candidate_id: int, queue_id: int
+) -> str:
+    finished = store.update_trend_candidate_workflow_a(
+        candidate_id=candidate_id,
+        fields={"status": "queued", "used_in_queue_id": int(queue_id)},
+    )
+    return (finished or {}).get("status", "queued")
+
+
+def _run_trendeng_schedule_approve(
     config: AccountConfig, *, candidate_id: int
 ) -> tuple[int, dict[str, Any]]:
-    """Approve -> enqueue through the EXISTING publish queue. Idempotent."""
+    """Content approval only — CAS pending_approval -> approved, await scheduling."""
     store = _store(config)
     candidate = store.get_trend_candidate(candidate_id)
     if candidate is None:
         return 2, {"ok": False, "account": config.name,
                    "error": f"candidate {candidate_id} not found for this account"}
-    if candidate.get("used_in_queue_id"):
-        return 0, {
+    if candidate.get("status") == "approved":
+        return 0, {"ok": True, "account": config.name, "id": candidate_id,
+                   "status": "approved", "already_approved": True}
+    if candidate.get("status") != "pending_approval":
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate is {candidate.get('status')}, not pending_approval"}
+    draft, topic = _candidate_draft(candidate)
+    if not draft:
+        return 2, {"ok": False, "account": config.name,
+                   "error": "no draft text on candidate — redraft before approval"}
+    moved = store.transition_trend_candidate(
+        candidate_id=candidate_id, from_status="pending_approval", to_status="approved"
+    )
+    if moved is None:
+        current = store.get_trend_candidate(candidate_id) or {}
+        return 0, {"ok": True, "account": config.name, "id": candidate_id,
+                   "status": current.get("status"),
+                   "already_approved": current.get("status") == "approved"}
+    logger.info("schedule: candidate #%d content approved; awaiting scheduling choice", candidate_id)
+    return 0, {"ok": True, "account": config.name, "id": candidate_id,
+               "status": "approved", "topic": topic}
+
+
+def _load_schedulable_candidate(
+    config: AccountConfig, candidate_id: int
+) -> tuple[SupabaseStore, dict[str, Any] | None, dict[str, Any] | None]:
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return store, None, {"ok": False, "account": config.name,
+                             "error": f"candidate {candidate_id} not found for this account"}
+    if candidate.get("status") == "queued" and candidate.get("used_in_queue_id"):
+        qid = candidate["used_in_queue_id"]
+        table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+        row = store.fetch_queue_row(table, qid) or {}
+        return store, None, {
             "ok": True, "account": config.name, "id": candidate_id,
-            "status": candidate.get("status"),
-            "queue_id": candidate.get("used_in_queue_id"),
+            "status": "queued", "queue_id": qid,
+            "queue_status": row.get("status"),
+            "scheduled_at": row.get("scheduled_at"),
             "already_queued": True,
         }
+    if candidate.get("status") != "approved":
+        return store, None, {"ok": False, "account": config.name,
+                             "error": f"candidate is {candidate.get('status')}, not approved (approve first)"}
+    draft, _topic = _candidate_draft(candidate)
+    if not draft:
+        return store, None, {"ok": False, "account": config.name,
+                             "error": "no draft text on candidate — redraft before scheduling"}
+    return store, candidate, None
+
+
+def _run_trendeng_schedule_best(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    store, candidate, err = _load_schedulable_candidate(config, candidate_id)
+    if err is not None:
+        return (0 if err.get("already_queued") else 2), err
+    assert candidate is not None
+    cfg = _scheduling_config(config)
+    now_utc = datetime.now(timezone.utc)
+    since = (now_utc - timedelta(days=cfg.history_window_days)).isoformat()
+    try:
+        insight_rows = store.list_post_insight_rows(since_utc=since, limit=cfg.max_insight_rows)
+    except Exception:  # noqa: BLE001
+        logger.warning("schedule: insight history unavailable; using fallback", exc_info=True)
+        insight_rows = []
+    occupied = []
+    try:
+        rows = store.list_scheduled_queue_rows(
+            config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue",
+            from_utc=now_utc.isoformat(),
+        )
+        occupied = [ts for ts in (_parse_ts(r.get("scheduled_at")) for r in rows) if ts]
+    except Exception:  # noqa: BLE001
+        logger.warning("schedule: queue occupancy unavailable; scheduling without collision data",
+                       exc_info=True)
+    rec = recommend_slot(insight_rows, occupied, now=now_utc, config=cfg)
+    logger.info(
+        "schedule: candidate #%d best-time source=%s slot=%s score=%.4f n=%d reason=%s",
+        candidate_id, rec.source, rec.scheduled_utc.isoformat(), rec.score,
+        rec.sample_size, rec.reason,
+    )
+    row = _ensure_approved_queue_row(store, config, candidate, scheduled_utc=rec.scheduled_utc)
+    status = _finalize_scheduled_candidate(store, candidate_id=candidate_id, queue_id=int(row["id"]))
+    draft, _ = _candidate_draft(candidate)
+    return 0, {
+        "ok": True, "account": config.name, "id": candidate_id, "status": status,
+        "queue_id": row.get("id"), "queue_status": "approved",
+        "scheduled_at": rec.scheduled_utc.isoformat(), "schedule_source": rec.source,
+        "score": rec.score, "sample_size": rec.sample_size, "reason": rec.reason,
+        "draft_preview": draft[:200],
+    }
+
+
+def _run_trendeng_schedule_now(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    store, candidate, err = _load_schedulable_candidate(config, candidate_id)
+    if err is not None:
+        return (0 if err.get("already_queued") else 2), err
+    assert candidate is not None
+    now_utc = datetime.now(timezone.utc)
+    logger.info("schedule: candidate #%d post-now @ %s", candidate_id, now_utc.isoformat())
+    row = _ensure_approved_queue_row(store, config, candidate, scheduled_utc=now_utc)
+    status = _finalize_scheduled_candidate(store, candidate_id=candidate_id, queue_id=int(row["id"]))
+    return 0, {
+        "ok": True, "account": config.name, "id": candidate_id, "status": status,
+        "queue_id": row.get("id"), "queue_status": "approved",
+        "scheduled_at": now_utc.isoformat(), "schedule_source": "now",
+    }
+
+
+def _run_trendeng_schedule_time(
+    config: AccountConfig, *, candidate_id: int, at: str
+) -> tuple[int, dict[str, Any]]:
+    store, candidate, err = _load_schedulable_candidate(config, candidate_id)
+    if err is not None:
+        return (0 if err.get("already_queued") else 2), err
+    assert candidate is not None
+    ts = _parse_ts(at)
+    if ts is None:
+        return 2, {"ok": False, "account": config.name, "error": f"invalid --at timestamp: {at!r}"}
+    logger.info("schedule: candidate #%d custom time @ %s", candidate_id, ts.isoformat())
+    row = _ensure_approved_queue_row(store, config, candidate, scheduled_utc=ts)
+    status = _finalize_scheduled_candidate(store, candidate_id=candidate_id, queue_id=int(row["id"]))
+    return 0, {
+        "ok": True, "account": config.name, "id": candidate_id, "status": status,
+        "queue_id": row.get("id"), "queue_status": "approved",
+        "scheduled_at": ts.isoformat(), "schedule_source": "custom",
+    }
+
+
+def _run_trendeng_schedule_cancel(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Cancel scheduling. Content is NOT published; stays approved, resumable.
+
+    If a draft queue row already exists for this candidate it is removed so no
+    stale draft lingers. An already-approved/posted row is left untouched.
+    """
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate {candidate_id} not found for this account"}
+    status = candidate.get("status")
+    qid = candidate.get("used_in_queue_id")
+    if status == "queued" and qid:
+        return 0, {"ok": True, "account": config.name, "id": candidate_id,
+                   "status": "queued", "queue_id": qid,
+                   "note": "already scheduled; use the publish queue to change it"}
+    if qid:
+        table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
+        row = store.fetch_queue_row(table, qid)
+        if row and row.get("status") == "draft":
+            store._patch_queue_row(table, qid, {"status": "failed",
+                                                "last_error": "scheduling cancelled"})
+            logger.info("schedule: cancel removed stale draft queue row #%s", qid)
+    logger.info("schedule: candidate #%d scheduling cancelled; content remains approved, not published",
+                candidate_id)
+    return 0, {"ok": True, "account": config.name, "id": candidate_id,
+               "status": status if status in TREND_STATUSES else "approved",
+               "cancelled": True}
+
+
+def _run_trendeng_approve(
+    config: AccountConfig, *, candidate_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Approve = content approved for publication (no queue row created here).
+
+    This handler now ONLY approves the content (CAS pending_approval ->
+    approved) and signals the dispatcher to ask *when* to publish. The queue
+    row is created as ``approved`` by the subsequent scheduling choice
+    (schedule-best / schedule-now / schedule-time). This is the fix for the
+    regression where approved content was left stuck as a ``draft`` queue row.
+    """
+    store = _store(config)
+    candidate = store.get_trend_candidate(candidate_id)
+    if candidate is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"candidate {candidate_id} not found for this account"}
+    if candidate.get("status") == "queued" and candidate.get("used_in_queue_id"):
+        return 0, {
+            "ok": True, "account": config.name, "id": candidate_id,
+            "status": "queued", "queue_id": candidate.get("used_in_queue_id"),
+            "already_queued": True,
+        }
+    if candidate.get("status") == "approved":
+        return 0, {"ok": True, "account": config.name, "id": candidate_id,
+                   "status": "approved", "already_approved": True}
     if candidate.get("status") != "pending_approval":
         return 2, {"ok": False, "account": config.name,
                    "error": f"candidate is {candidate.get('status')}, not pending_approval"}
 
-    wa = (candidate.get("raw_metadata") or {}).get("workflow_a") or {}
-    draft = (wa.get("draft_text") or "").strip()
+    draft, topic = _candidate_draft(candidate)
     if not draft:
         return 2, {"ok": False, "account": config.name,
                    "error": "no draft text on candidate — redraft before approval"}
-    topic = (candidate.get("topic") or wa.get("topic") or "").strip() or None
 
-    # CAS pending_approval -> approved first so a double-approval races here
-    # instead of double-enqueueing.
     moved = store.transition_trend_candidate(
         candidate_id=candidate_id, from_status="pending_approval", to_status="approved"
     )
@@ -1151,22 +1482,13 @@ def _run_trendeng_approve(
             "ok": True, "account": config.name, "id": candidate_id,
             "status": current.get("status"),
             "queue_id": current.get("used_in_queue_id"),
-            "already_queued": bool(current.get("used_in_queue_id")),
+            "already_approved": current.get("status") == "approved",
         }
-
-    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
-    campaign = config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
-    queue_row = store.enqueue_draft(
-        table, draft, reply_texts=[], campaign_code=campaign, topic=topic
-    )
-    finished = store.update_trend_candidate_workflow_a(
-        candidate_id=candidate_id,
-        fields={"status": "queued", "used_in_queue_id": int(queue_row["id"])},
-    )
+    logger.info("schedule: candidate #%d approved; prompting for scheduling choice", candidate_id)
     return 0, {
         "ok": True, "account": config.name, "id": candidate_id,
-        "status": (finished or {}).get("status", "queued"),
-        "queue_id": queue_row.get("id"), "topic": topic,
+        "status": "approved", "topic": topic, "needs_scheduling": True,
+        "draft_preview": draft[:200],
     }
 
 
@@ -1430,7 +1752,9 @@ def _run_trendeng_use(
         }
 
     # CAS backlog -> approved first so a double-use races here instead of
-    # double-enqueueing.
+    # double-scheduling. The queue row itself is created as ``approved`` by the
+    # dispatcher's follow-up scheduling choice (schedule-best/now/time), so a
+    # backlog item is never left stuck as a draft.
     moved = store.transition_trend_candidate(
         candidate_id=candidate_id, from_status="backlog", to_status="approved"
     )
@@ -1444,23 +1768,16 @@ def _run_trendeng_use(
             "queue_id": current.get("used_in_queue_id"),
             "already_queued": bool(current.get("used_in_queue_id")),
         }
-
-    table = config.get("THREADS_QUEUE_TABLE", "threads_publish_queue") or "threads_publish_queue"
-    campaign = config.get("THREADS_QUEUE_CAMPAIGN_CODE", "") or None
-    queue_row = store.enqueue_draft(
-        table, draft, reply_texts=[], campaign_code=campaign, topic=topic
-    )
-    finished = store.update_trend_candidate_workflow_a(
-        candidate_id=candidate_id,
-        fields={"status": "queued", "used_in_queue_id": int(queue_row["id"])},
-    )
+    logger.info("schedule: backlog candidate #%d approved; prompting for scheduling choice",
+                candidate_id)
     return 0, {
         "ok": True,
         "account": config.name,
         "id": candidate_id,
-        "status": (finished or {}).get("status", "queued"),
-        "queue_id": queue_row.get("id"),
+        "status": "approved",
         "topic": topic,
+        "needs_scheduling": True,
+        "draft_preview": draft[:200],
     }
 
 
@@ -1868,6 +2185,18 @@ def main(
             )
         elif args.command == "trend-engagement" and args.trendeng_command == "approve":
             code, payload = _run_trendeng_approve(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "schedule-approve":
+            code, payload = _run_trendeng_schedule_approve(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "schedule-best":
+            code, payload = _run_trendeng_schedule_best(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "schedule-now":
+            code, payload = _run_trendeng_schedule_now(config, candidate_id=args.id)
+        elif args.command == "trend-engagement" and args.trendeng_command == "schedule-time":
+            code, payload = _run_trendeng_schedule_time(
+                config, candidate_id=args.id, at=args.at
+            )
+        elif args.command == "trend-engagement" and args.trendeng_command == "schedule-cancel":
+            code, payload = _run_trendeng_schedule_cancel(config, candidate_id=args.id)
         elif args.command == "trend-engagement" and args.trendeng_command == "edit":
             code, payload = _run_trendeng_edit(
                 config, candidate_id=args.id, text=args.text
