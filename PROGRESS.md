@@ -101,6 +101,15 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 7. ~~Telegram DM approval workflow (Task #2 continuation)~~ — DONE (Task 2C, 2026-09-25); apply `migrations/016_dm_approval_workflow.sql` to production to enable.
 8. ~~Safe browser-based Threads DM sender (Task 2D)~~ — DONE (2026-09-25); apply `migrations/016` then `017_dm_send.sql` to production in order, restart gateway, then controlled live verification per `docs/task2d-live-readiness.md`.
 
+
+## Planned — Superpower Roadmap
+
+Current implementation priority remains **Task #2** and **Task #3**. Tasks #4 and #5 are documented for later implementation in [`docs/superpower-roadmap.md`](docs/superpower-roadmap.md).
+
+- **Task #4 — Closed-Loop Content Intelligence:** collect post-performance snapshots, preserve account-scoped evidence, derive explainable performance learnings in Hermes, and feed those learnings into Task #3 smart scheduling.
+- **Task #5 — Autonomous Content Planner:** use performance intelligence, queue state, recent posts, content pillars, trend candidates, and persona context to propose future content plans while preserving mandatory human approval before publication.
+- Dependency order: **#2 stable -> #3 stable -> #4 -> #4/#3 scheduling integration -> #5**.
+
 ## Deliberately Later / Non-Goals
 
 - Web dashboard.
