@@ -103,6 +103,100 @@ def generate_reply_draft(
     return draft
 
 
+# ---------------------------------------------------------------------------
+# Task 2C — DM draft generation
+# ---------------------------------------------------------------------------
+
+# A DM is not a public reply: 1:1, must not look like spam or a cold pitch.
+DM_CHAR_LIMIT = 1000
+
+
+def _dm_system_prompt(persona_text: str) -> str:
+    return (
+        "You draft ONE private direct message (DM) on Threads to someone who "
+        "replied to the account's own post and showed real interest.\n\n"
+        f"ACCOUNT PERSONA:\n{persona_text}\n\n"
+        "RULES:\n"
+        "- Write in the persona's voice and language (Malay-first for syaqir).\n"
+        "- 1-4 short sentences. Warm, personal, no corporate tone, no hype.\n"
+        "- Acknowledge THEIR actual reply — reference what they said.\n"
+        "- If a CTA / offer / business objective is given, carry it forward "
+        "naturally (e.g. share the link, explain the next step). If none is "
+        "given, do NOT invent one.\n"
+        "- No aggressive sales language, no pressure, no fake urgency.\n"
+        "- Never fabricate facts, prices, or promises the context does not state.\n"
+        "- This is a private 1:1 message, not a public post.\n"
+        f"- HARD LIMIT: {DM_CHAR_LIMIT} characters.\n"
+        "- Output ONLY the DM text. No preamble, no quotes."
+    )
+
+
+def generate_dm_draft(
+    *,
+    store: Any,
+    opportunity: dict[str, Any],
+    persona_text: str,
+    providers: list[content_generation.LLMProviderSpec] | None = None,
+    client: Any = None,
+) -> str:
+    """Generate the DM draft for a DM opportunity (Hermes LLM layer).
+
+    Threads Operator supplies the structured context (persona, root post,
+    CTA, the incoming reply, intent, lead score); Hermes owns the wording.
+    No provider credentials live here — ``content_generation`` resolves them.
+    The returned text is persisted verbatim by the caller.
+    """
+    root_post = opportunity.get("root_post_text") or "(original post text unavailable)"
+    reply = opportunity.get("reply_text") or "(their reply text unavailable)"
+    username = opportunity.get("from_username") or "someone"
+    intent = opportunity.get("intent") or "(intent unknown)"
+    lead = opportunity.get("lead_score")
+    lead_str = f"{float(lead):.2f}" if isinstance(lead, (int, float)) else "(n/a)"
+    cta = opportunity.get("cta_matched")
+
+    cta_block = (
+        f"CTA / offer they responded to:\n{cta}\n\n"
+        if cta
+        else "(no specific CTA was matched — keep the message conversational, "
+        "do not push an offer)\n\n"
+    )
+
+    user_prompt = (
+        f"Their Threads username: @{username}\n\n"
+        f"Our original post:\n{str(root_post)[:600]}\n\n"
+        f"Their reply to it:\n{str(reply)[:600]}\n\n"
+        f"Detected intent: {intent}\n"
+        f"Lead score: {lead_str}\n\n"
+        f"{cta_block}"
+        "Draft the DM."
+    )
+    draft = content_generation.generate_text(
+        system_prompt=_dm_system_prompt(persona_text),
+        user_prompt=user_prompt,
+        max_output_tokens=500,
+        providers=providers,
+        client=client,
+    ).strip()
+    if len(draft) > DM_CHAR_LIMIT:
+        compress = (
+            f"That DM was {len(draft)} characters — over the {DM_CHAR_LIMIT} "
+            f"limit. Rewrite shorter, same meaning, same voice.\nDM:\n{draft}"
+        )
+        draft = content_generation.generate_text(
+            system_prompt=_dm_system_prompt(persona_text),
+            user_prompt=compress,
+            max_output_tokens=500,
+            providers=providers,
+            client=client,
+        ).strip()
+    if len(draft) > DM_CHAR_LIMIT:
+        raise ValueError(
+            f"DM draft still over {DM_CHAR_LIMIT} chars after retry "
+            f"({len(draft)} chars)"
+        )
+    return draft
+
+
 def card_text(row: dict[str, Any]) -> str:
     """Telegram approval card body for one inbound reply."""
     parent = (row.get("parent_post_text") or "(our post)")[:140]
@@ -163,3 +257,79 @@ def discover_new_replies(
             if row.get("status") == "discovered":
                 new_rows.append(row)
     return new_rows
+
+
+def classify_reply(
+    *,
+    store: Any,
+    account_key: str,
+    reply_row: dict[str, Any],
+    persona_text: str | None = None,
+    cta_patterns: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Assemble context + classify intent for one reply row.
+
+    This is the deterministic intelligence layer: it assembles structured
+    context, classifies intent, and optionally creates a DM opportunity.
+    It does NOT send any DM — it only prepares the data for the
+    Telegram/browser layers.
+
+    Returns a dict with:
+    - context: the assembled ReplyContext
+    - classification: the IntentClassification
+    - dm_opportunity: the DMOppotunityResult (if created)
+    - updated_row: the updated reply row with context/intent fields
+    """
+    from . import dm_opportunity, reply_context, reply_intent
+
+    # 1. Assemble deterministic context
+    context = reply_context.assemble_reply_context(
+        store=store,
+        account_key=account_key,
+        reply_row=reply_row,
+        persona_text=persona_text,
+        cta_patterns=cta_patterns,
+    )
+
+    # 2. Classify intent
+    classification = reply_intent.classify_reply_intent(
+        context=context,
+        reply_text=reply_row.get("reply_text"),
+        post_cta=context.post_cta,
+        cta_patterns=cta_patterns,
+    )
+
+    # 3. Persist context + intent on the reply row
+    updated_row = store.update_own_reply(
+        row_id=int(reply_row["id"]),
+        fields={
+            "context_json": context.to_dict(),
+            "intent": classification.intent,
+            "intent_evidence": classification.evidence.to_dict(),
+            "lead_score": classification.lead_score,
+            "classified_at": store._utc_now(),
+        },
+    )
+
+    # 4. Optionally create DM opportunity
+    dm_result = None
+    if reply_intent.should_create_dm_opportunity(classification):
+        dm_result = dm_opportunity.create_dm_opportunity(
+            store=store,
+            account_key=account_key,
+            context=context,
+            classification=classification,
+        )
+        if dm_result.success and dm_result.opportunity_id:
+            dm_opportunity.link_reply_to_dm_opportunity(
+                store=store,
+                reply_row_id=int(reply_row["id"]),
+                dm_opportunity_id=dm_result.opportunity_id,
+            )
+
+    return {
+        "context": context,
+        "classification": classification,
+        "dm_opportunity": dm_result,
+        "updated_row": updated_row,
+    }

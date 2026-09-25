@@ -1859,3 +1859,188 @@ class SupabaseStore:
         response.raise_for_status()
         rows = response.json() or []
         return rows[0] if rows else None
+
+    # ------------------------------------------------------------------
+    # DM opportunity store methods (Workflow B context/intent layer)
+    # ------------------------------------------------------------------
+
+    DM_OPPORTUNITY_TABLE = "threads_dm_opportunities"
+
+    DM_OPPORTUNITY_STATUSES = frozenset({
+        "detected", "drafted", "awaiting_approval", "approved",
+        "sending", "sent", "rejected", "failed", "expired", "cancelled",
+    })
+
+    def insert_dm_opportunity(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Insert a DM opportunity row. Returns the inserted row, or None on
+        unique-constraint conflict (dedup)."""
+        account_key = self._require_account_key()
+        body = dict(payload)
+        body["account_key"] = account_key
+        # Never allow caller to set id or override account_key
+        body.pop("id", None)
+        response = self.client.post(
+            f"{self.base_url}/rest/v1/{self.DM_OPPORTUNITY_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            json=body,
+        )
+        if response.status_code == 409:
+            return None
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
+
+    def get_dm_opportunity(self, opportunity_id: int) -> dict[str, Any] | None:
+        account_key = self._require_account_key()
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.DM_OPPORTUNITY_TABLE}",
+            headers=self._headers,
+            params={
+                "select": "*",
+                "id": f"eq.{opportunity_id}",
+                "account_key": f"eq.{account_key}",
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        for row in response.json() or []:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
+
+    def get_dm_opportunity_by_dedupe(
+        self, *, account_key: str, from_username: str, root_post_id: str
+    ) -> dict[str, Any] | None:
+        """Fetch one DM opportunity by its dedupe key."""
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.DM_OPPORTUNITY_TABLE}",
+            headers=self._headers,
+            params={
+                "select": "*",
+                "account_key": f"eq.{account_key}",
+                "from_username": f"eq.{from_username}",
+                "root_post_id": f"eq.{root_post_id}",
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        for row in response.json() or []:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
+
+    def list_dm_opportunities(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        account_key = self._require_account_key()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("limit must be an integer between 1 and 200")
+        if status is not None and status not in self.DM_OPPORTUNITY_STATUSES:
+            raise ValueError(
+                "status must be one of: " + ", ".join(sorted(self.DM_OPPORTUNITY_STATUSES))
+            )
+        params: dict[str, Any] = {
+            "select": "*",
+            "account_key": f"eq.{account_key}",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        }
+        if status:
+            params["status"] = f"eq.{status}"
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.DM_OPPORTUNITY_TABLE}",
+            headers=self._headers,
+            params=params,
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
+
+    def transition_dm_opportunity(
+        self,
+        *,
+        opportunity_id: int,
+        from_status: str | tuple[str, ...],
+        to_status: str,
+        fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS transition on a DM opportunity row."""
+        account_key = self._require_account_key()
+        if to_status not in self.DM_OPPORTUNITY_STATUSES:
+            raise ValueError(f"invalid DM opportunity status {to_status!r}")
+        body: dict[str, Any] = {"status": to_status, "updated_at": self._utc_now()}
+        for key, value in (fields or {}).items():
+            if key in {"id", "account_key", "source_reply_id", "status"}:
+                continue
+            body[key] = value
+        from_list = (
+            [from_status] if isinstance(from_status, str) else list(from_status)
+        )
+        for state in from_list:
+            if state not in self.DM_OPPORTUNITY_STATUSES:
+                raise ValueError(f"invalid from_status {state!r}")
+        params: dict[str, Any] = {
+            "id": f"eq.{opportunity_id}",
+            "account_key": f"eq.{account_key}",
+        }
+        if len(from_list) == 1:
+            params["status"] = f"eq.{from_list[0]}"
+        else:
+            params["status"] = "in.(" + ",".join(from_list) + ")"
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{self.DM_OPPORTUNITY_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params=params,
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
+
+    def find_expired_dm_opportunities(
+        self, *, now: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Find DM opportunities past their expiry that are still active."""
+        account_key = self._require_account_key()
+        active_statuses = ["detected", "drafted", "awaiting_approval", "approved", "sending"]
+        response = self.client.get(
+            f"{self.base_url}/rest/v1/{self.DM_OPPORTUNITY_TABLE}",
+            headers=self._headers,
+            params={
+                "select": "id,status,expires_at",
+                "account_key": f"eq.{account_key}",
+                "status": "in.(" + ",".join(active_statuses) + ")",
+                "expires_at": f"lt.{now}",
+                "limit": str(limit),
+            },
+        )
+        response.raise_for_status()
+        return [r for r in response.json() or [] if isinstance(r, dict)]
+
+    def update_own_reply(
+        self, *, row_id: int, fields: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Update arbitrary fields on an own_reply_engagement row."""
+        account_key = self._require_account_key()
+        body: dict[str, Any] = {"updated_at": self._utc_now()}
+        for key, value in fields.items():
+            if key in {"id", "account_key", "reply_id", "status"}:
+                continue
+            body[key] = value
+        response = self.client.patch(
+            f"{self.base_url}/rest/v1/{self.OWN_REPLY_TABLE}",
+            headers={**self._headers, "Prefer": "return=representation"},
+            params={"id": f"eq.{row_id}", "account_key": f"eq.{account_key}"},
+            json=body,
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("account_key") == account_key:
+                return row
+        return None
