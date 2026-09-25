@@ -67,6 +67,18 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 - `tests/test_reply_context_intent.py`: 33 tests covering all 10 required test scenarios + integration tests.
 - Full regression suite: **660 passed, 1 skipped** (baseline 627 + 33 new).
 
+### Task 2C — Telegram DM Approval Workflow (DONE, 2026-09-25)
+
+- DM opportunity → Hermes-generated draft → persisted exactly → Telegram approval card → Approve/Edit/Reject → `approved` (or terminal rejection/expiry). **No Threads DM is sent** — Task 2D consumes only `approved` rows.
+- `dm_opportunity.py`: `draft_dm_opportunity`, `mark_dm_awaiting_approval`, `approve_dm_opportunity` (snapshots `dm_approved_text`), `reject_dm_opportunity`, `edit_dm_opportunity_draft` (stays `awaiting_approval`, never auto-approves), `record_dm_approval_card_sent`, `list_dm_opportunities_needing_card`, `expire_stale_opportunities`. All CAS-guarded + account-scoped; expiry fail-closed.
+- `own_replies.generate_dm_draft`: persona + root post + CTA + incoming reply + intent + lead score. No fabricated context; Hermes owns wording; no provider credentials in the operator.
+- `operator_cli`: `own-replies dm {draft,card,approve,edit,reject,mark-card-sent,needing-card}`.
+- `workflow_telegram.DMDispatcher` (`dmopp:` prefix) reuses `_BaseWorkflowDispatcher` + `PendingEditStore` (30-min edit expiry, restart-safe); post-edit refreshed card; `DMTelegramBridge` gateway alias.
+- Gateway adapter (`plugins/platforms/telegram/adapter.py`): `dmopp:` route + `_get_dm_approval_bridge` + edit-session interceptor. Reuses `_dispatch_threads_operator_callback`; no separate dispatch system.
+- `migrations/016_dm_approval_workflow.sql`: `drafted_at`, `edited_at`, `approval_message_ref`, `approved_by`, `reject_reason` + watchdog index.
+- Watchdog: `run_dm_approval_pass()` in `own_replies_watchdog_5m.py` — draft → card → stamp `approval_message_ref`; idempotent (no duplicate cards); reuses the existing 5-min job, no new runtime job.
+- `tests/test_dm_approval.py`: 35 tests covering all 16 required scenarios. Full suite **698 passed, 1 skipped**.
+
 ## Deployment Next
 
 1. ~~Apply `migrations/002_post_daily_rollups.sql` to production Supabase~~ — DONE (externally verified 2026-09-23; table exists, RLS on, PK/indexes present; `rebuild_rollups.py` blocker cleared).
@@ -75,8 +87,8 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 4. ~~Fresh-VPS end-to-end run including a throwaway Supabase project replay of all migrations incl. 014~~ — DONE (see `docs/fresh-install-verification.md`; only live-posting/browser steps remain deliberately out of scope).
 5. Multi-account hardening soak (per-account failure isolation under simultaneous operation).
 6. **Apply `migrations/015_reply_context_intent.sql` to production Supabase** when ready to enable context/intent layer.
-7. **Telegram DM approval workflow** (Task #2 continuation) — consumes `threads_dm_opportunities`.
-8. **Safe browser-based Threads DM sender** (Task #3) — consumes approved DM opportunities.
+7. ~~Telegram DM approval workflow (Task #2 continuation)~~ — DONE (Task 2C, 2026-09-25); apply `migrations/016_dm_approval_workflow.sql` to production to enable.
+8. **Safe browser-based Threads DM sender** (Task 2D) — consumes approved DM opportunities only.
 
 ## Deliberately Later / Non-Goals
 
