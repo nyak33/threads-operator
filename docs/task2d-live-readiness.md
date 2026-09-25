@@ -30,18 +30,41 @@ send real DMs, and the controlled live-verification procedure.
 
 ## Manual production actions (NOT done automatically)
 
-1. **Apply migrations in order** to production Supabase:
-   - `016_dm_approval_workflow.sql` (from Task 2C — still pending)
-   - `017_dm_send.sql` (this task)
-   Order matters: 017 extends the status CHECK introduced by 015 and builds on
-   016's approval fields. Apply 015 → 016 → 017.
-2. **Restart the Hermes gateway** so the Task 2C `dmopp:` adapter route is live
-   (`systemctl --user restart hermes-gateway.service`) — pending from Task 2C.
+1. **Apply migrations in order** to production Supabase. **VERIFIED 2026-09-25
+   (Task 2E Phase 3 read-back): production has NO DM schema at all** —
+   `threads_dm_opportunities` is ABSENT and `threads_own_reply_engagement` has
+   NO context/intent columns. Therefore **015, 016, AND 017 are ALL unapplied**
+   (not just 016/017 as previously assumed). Apply in order:
+   - `015_reply_context_intent.sql` (creates `threads_dm_opportunities` + context/intent cols)
+   - `016_dm_approval_workflow.sql`
+   - `017_dm_send.sql`
+   This host has no psql / Supabase CLI / DB connection string — apply via the
+   Supabase dashboard SQL editor. Order matters: each builds on the prior.
+2. **Restart the Hermes gateway** so the Task 2C `dmopp:` adapter route is live.
+   The running process (started 17:59:51 +08) predates the route commit
+   `1485c5a5` (created 20:01:53), so the route is NOT loaded. The gateway blocks
+   self-restart from inside its own process — run from a separate shell:
+   `systemctl --user restart hermes-gateway.service` (or `hermes gateway restart`).
 3. **Confirm the persistent browser session is logged in** to the correct
-   Threads account (`syaqir`) and not showing any challenge. The sender reads
-   `THREADS_BROWSER_PROFILE` (default `~/.threads-operator/browser-profiles/syaqir`).
-4. **Set the Telegram env vars** for the watchdog notifications if not already
+   Threads account and not showing any challenge. VERIFIED 2026-09-25 (Phase 5):
+   CDP reachable (Chrome/145), `/messages` loads, NO CAPTCHA/2FA/login/warning,
+   persistent profile `~/.threads-operator/browser-profiles/syaqir`. Logged-in
+   username = **`syaqir_sharani`** (NOT the account_key label `syaqir`).
+4. **`THREADS_USERNAME` is set** in `accounts/syaqir.env` to `syaqir_sharani`
+   (done 2026-09-25, commit `c5b6b4f`) so account verification compares the
+   browser login against the real Threads username, not the account_key label.
+5. **Set the Telegram env vars** for the watchdog notifications if not already
    exported: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+
+## Account-verification fix (Task 2E, commit c5b6b4f)
+
+Phase 5 live readiness exposed a real pre-live defect: the sender compared the
+browser login against the `account_key` operator label (`syaqir`) instead of the
+real Threads username (`syaqir_sharani`), so the legitimate account would have
+failed `account_mismatch` and blocked every send. Fixed: `THREADS_USERNAME`
+config carries the real handle; the WHOAMI probe now reads the logged-in account
+from the frequent `/@<user>` own-profile links (was matching `/search`).
+Verified live: probe returns `syaqir_sharani`, matches `THREADS_USERNAME`.
 
 ## Controlled live-verification procedure (requires an approved recipient)
 
