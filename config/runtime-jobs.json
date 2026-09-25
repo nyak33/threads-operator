@@ -45,7 +45,7 @@
       "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
       "deliver": "local",
       "account_scoped": true,
-      "purpose": "Every 5m: publish execute-approved own-post replies; poll new inbound replies on own posts; draft replies for approval-pending ones and send Telegram approval cards."
+      "purpose": "Every 5m: publish execute-approved own-post replies; poll new inbound replies on own posts; draft replies for approval-pending ones and send Telegram approval cards; Task 2C: draft DM opportunities and send Telegram approval cards (no DM is sent)."
     },
     {
       "name": "Threads Trend Approval Timeout Watchdog ({{ACCOUNT}})",

@@ -368,6 +368,49 @@ def _parser() -> argparse.ArgumentParser:
                                   help="one specific row id (default: all approved)")
     ownreply_publish.add_argument("--dry-run", action="store_true")
 
+    # --- Task 2C: DM opportunity approval (own-replies dm ...) ---
+    ownreply_dm = ownreply_sub.add_parser(
+        "dm", help="DM opportunity approval workflow (Task 2C — no DM is sent)"
+    )
+    ownreply_dm_sub = ownreply_dm.add_subparsers(dest="dm_command", required=True)
+
+    ownreply_dm_draft = ownreply_dm_sub.add_parser(
+        "draft", help="generate + persist the DM draft (detected -> drafted)")
+    ownreply_dm_draft.add_argument("--account")
+    ownreply_dm_draft.add_argument("--id", type=int, required=True)
+
+    ownreply_dm_card = ownreply_dm_sub.add_parser(
+        "card", help="render the Telegram approval card text for one opportunity")
+    ownreply_dm_card.add_argument("--account")
+    ownreply_dm_card.add_argument("--id", type=int, required=True)
+
+    ownreply_dm_approve = ownreply_dm_sub.add_parser("approve")
+    ownreply_dm_approve.add_argument("--account")
+    ownreply_dm_approve.add_argument("--id", type=int, required=True)
+    ownreply_dm_approve.add_argument("--approval-ref", default=None)
+
+    ownreply_dm_edit = ownreply_dm_sub.add_parser("edit")
+    ownreply_dm_edit.add_argument("--account")
+    ownreply_dm_edit.add_argument("--id", type=int, required=True)
+    ownreply_dm_edit.add_argument("--text", required=True)
+
+    ownreply_dm_reject = ownreply_dm_sub.add_parser("reject")
+    ownreply_dm_reject.add_argument("--account")
+    ownreply_dm_reject.add_argument("--id", type=int, required=True)
+    ownreply_dm_reject.add_argument("--approval-ref", default=None)
+
+    ownreply_dm_mark = ownreply_dm_sub.add_parser(
+        "mark-card-sent",
+        help="stamp the Telegram message ref after the card is delivered")
+    ownreply_dm_mark.add_argument("--account")
+    ownreply_dm_mark.add_argument("--id", type=int, required=True)
+    ownreply_dm_mark.add_argument("--message-ref", required=True)
+
+    ownreply_dm_needing = ownreply_dm_sub.add_parser(
+        "needing-card", help="list opportunities the watchdog must act on")
+    ownreply_dm_needing.add_argument("--account")
+    ownreply_dm_needing.add_argument("--limit", type=int, default=50)
+
     return parser
 
 
@@ -1995,6 +2038,215 @@ def _run_ownreply_edit(
     return 0, {"ok": True, "account": config.name, "id": row_id, "proposed_text": text}
 
 
+# ---------------------------------------------------------------------------
+# Task 2C — DM opportunity approval runners (own-replies dm ...)
+# ---------------------------------------------------------------------------
+#
+# These runners own the approval half of the DM lifecycle:
+#   detected -> drafted -> awaiting_approval -> approved  (or rejected/expired)
+# None of them send a DM. Every mutation is CAS-guarded and account-scoped in
+# the store; a stale or cross-account call returns a clear non-zero payload.
+
+def _run_dm_draft(
+    config: AccountConfig, *, opportunity_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Generate the DM draft (Hermes LLM) and persist it, then move the row to
+    awaiting_approval. Idempotent for a row still in detected/drafted."""
+    from . import dm_opportunity, own_replies, trend_engagement
+
+    store = _store(config)
+    row = store.get_dm_opportunity(opportunity_id)
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"DM opportunity {opportunity_id} not found (or not this account)"}
+    if dm_opportunity.is_expired(row):
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": f"DM opportunity {opportunity_id} has expired"}
+    status = row.get("status")
+    if status == dm_opportunity.DM_STATUS_AWAITING_APPROVAL:
+        # Watchdog retry after a card was already prepared: do not re-draft.
+        return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+                   "status": status, "dm_draft_text": row.get("dm_draft_text"),
+                   "already_drafted": True,
+                   "card_text": _dm_card_text(row)}
+    if status not in (dm_opportunity.DM_STATUS_DETECTED, dm_opportunity.DM_STATUS_DRAFTED):
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "status": status, "already_decided": status in dm_opportunity.DM_TERMINAL_STATUSES,
+                   "error": f"DM opportunity {opportunity_id} is {status}; cannot draft"}
+
+    persona_text = trend_engagement.load_persona(_personas_root(), config.name)
+    try:
+        draft = own_replies.generate_dm_draft(
+            store=store, opportunity=row, persona_text=persona_text
+        )
+    except Exception as exc:  # noqa: BLE001
+        return 1, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": f"draft generation failed: {type(exc).__name__}: {exc}"}
+
+    drafted = dm_opportunity.draft_dm_opportunity(
+        store=store, opportunity_id=opportunity_id, draft_text=draft
+    )
+    if drafted is None:
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": "failed to persist draft (state changed concurrently)"}
+    moved = dm_opportunity.mark_dm_awaiting_approval(
+        store=store, opportunity_id=opportunity_id, approval_ref=None
+    )
+    final = moved or drafted
+    return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+               "status": final.get("status"), "dm_draft_text": draft,
+               "card_text": _dm_card_text(final)}
+
+
+def _run_dm_card(
+    config: AccountConfig, *, opportunity_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Render the approval card text for one opportunity (watchdog/dispatcher)."""
+    store = _store(config)
+    row = store.get_dm_opportunity(opportunity_id)
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"DM opportunity {opportunity_id} not found (or not this account)"}
+    return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+               "status": row.get("status"), "card_text": _dm_card_text(row)}
+
+
+def _dm_card_text(row: dict[str, Any]) -> str:
+    """Local card renderer (kept here so the CLI is self-contained; the
+    dispatcher may also render its own copy)."""
+    from . import workflow_telegram
+    return workflow_telegram.dm_approval_card_text(row)
+
+
+def _run_dm_approve(
+    config: AccountConfig, *, opportunity_id: int, approval_ref: str | None
+) -> tuple[int, dict[str, Any]]:
+    from . import dm_opportunity
+
+    store = _store(config)
+    row = store.get_dm_opportunity(opportunity_id)
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"DM opportunity {opportunity_id} not found (or not this account)"}
+    if row.get("status") == dm_opportunity.DM_STATUS_APPROVED:
+        # Duplicate Approve tap / retried callback: idempotent success.
+        return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+                   "status": "approved", "already_decided": True}
+    if dm_opportunity.is_expired(row):
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "status": row.get("status"),
+                   "error": f"DM opportunity {opportunity_id} has expired and cannot be approved"}
+    approved_by = None
+    if approval_ref:
+        approved_by = approval_ref  # "tg:<chat>:<msg>" — identifies the approver channel
+    moved = dm_opportunity.approve_dm_opportunity(
+        store=store, opportunity_id=opportunity_id, approved_by=approved_by
+    )
+    if moved is None:
+        current = store.get_dm_opportunity(opportunity_id) or {}
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "status": current.get("status"),
+                   "already_decided": current.get("status") in dm_opportunity.DM_TERMINAL_STATUSES
+                       or current.get("status") == dm_opportunity.DM_STATUS_APPROVED,
+                   "error": f"DM opportunity {opportunity_id} is not awaiting approval"}
+    return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+               "status": moved.get("status"), "dm_approved_text": moved.get("dm_approved_text")}
+
+
+def _run_dm_reject(
+    config: AccountConfig, *, opportunity_id: int, approval_ref: str | None
+) -> tuple[int, dict[str, Any]]:
+    from . import dm_opportunity
+
+    store = _store(config)
+    row = store.get_dm_opportunity(opportunity_id)
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"DM opportunity {opportunity_id} not found (or not this account)"}
+    if row.get("status") in dm_opportunity.DM_TERMINAL_STATUSES:
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "status": row.get("status"), "already_decided": True,
+                   "error": f"DM opportunity {opportunity_id} is already {row.get('status')}"}
+    moved = dm_opportunity.reject_dm_opportunity(
+        store=store, opportunity_id=opportunity_id
+    )
+    if moved is None:
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": f"failed to reject DM opportunity {opportunity_id}"}
+    return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+               "status": moved.get("status")}
+
+
+def _run_dm_edit(
+    config: AccountConfig, *, opportunity_id: int, text: str
+) -> tuple[int, dict[str, Any]]:
+    from . import dm_opportunity, own_replies
+
+    if not text or not text.strip():
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": "edited DM text is empty"}
+    if len(text) > own_replies.DM_CHAR_LIMIT:
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": f"edited DM is {len(text)} chars (limit {own_replies.DM_CHAR_LIMIT})"}
+    store = _store(config)
+    row = store.get_dm_opportunity(opportunity_id)
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"DM opportunity {opportunity_id} not found (or not this account)"}
+    if dm_opportunity.is_expired(row):
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "status": row.get("status"),
+                   "error": f"DM opportunity {opportunity_id} has expired and cannot be edited"}
+    try:
+        moved = dm_opportunity.edit_dm_opportunity_draft(
+            store=store, opportunity_id=opportunity_id, edited_text=text.strip()
+        )
+    except ValueError as exc:
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": str(exc)}
+    if moved is None:
+        current = store.get_dm_opportunity(opportunity_id) or {}
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "status": current.get("status"),
+                   "already_decided": current.get("status") in dm_opportunity.DM_TERMINAL_STATUSES,
+                   "error": f"DM opportunity {opportunity_id} is not awaiting approval"}
+    return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+               "status": moved.get("status"),
+               "dm_draft_text": moved.get("dm_draft_text"),
+               "card_text": _dm_card_text(moved)}
+
+
+def _run_dm_mark_card_sent(
+    config: AccountConfig, *, opportunity_id: int, message_ref: str
+) -> tuple[int, dict[str, Any]]:
+    from . import dm_opportunity
+
+    store = _store(config)
+    moved = dm_opportunity.record_dm_approval_card_sent(
+        store=store, opportunity_id=opportunity_id, message_ref=message_ref
+    )
+    if moved is None:
+        return 2, {"ok": False, "account": config.name, "id": opportunity_id,
+                   "error": f"DM opportunity {opportunity_id} is not awaiting approval (or not this account)"}
+    return 0, {"ok": True, "account": config.name, "id": opportunity_id,
+               "approval_message_ref": moved.get("approval_message_ref")}
+
+
+def _run_dm_needing_card(
+    config: AccountConfig, *, limit: int
+) -> tuple[int, dict[str, Any]]:
+    from . import dm_opportunity
+
+    store = _store(config)
+    rows = dm_opportunity.list_dm_opportunities_needing_card(store, limit=limit)
+    return 0, {"ok": True, "account": config.name, "count": len(rows),
+               "items": [{"id": r.get("id"), "status": r.get("status"),
+                          "from_username": r.get("from_username"),
+                          "has_draft": bool(r.get("dm_draft_text")),
+                          "has_card": bool(r.get("approval_message_ref"))}
+                         for r in rows]}
+
+
 def _run_ownreply_publish(
     config: AccountConfig, *, row_id: int | None, dry_run: bool
 ) -> tuple[int, dict[str, Any]]:
@@ -2257,6 +2509,26 @@ def main(
             code, payload = _run_ownreply_publish(
                 config, row_id=args.id, dry_run=args.dry_run
             )
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "draft":
+            code, payload = _run_dm_draft(config, opportunity_id=args.id)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "card":
+            code, payload = _run_dm_card(config, opportunity_id=args.id)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "approve":
+            code, payload = _run_dm_approve(
+                config, opportunity_id=args.id, approval_ref=args.approval_ref
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "edit":
+            code, payload = _run_dm_edit(config, opportunity_id=args.id, text=args.text)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "reject":
+            code, payload = _run_dm_reject(
+                config, opportunity_id=args.id, approval_ref=args.approval_ref
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "mark-card-sent":
+            code, payload = _run_dm_mark_card_sent(
+                config, opportunity_id=args.id, message_ref=args.message_ref
+            )
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "needing-card":
+            code, payload = _run_dm_needing_card(config, limit=args.limit)
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:

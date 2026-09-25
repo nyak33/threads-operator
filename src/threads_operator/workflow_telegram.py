@@ -46,6 +46,10 @@ BACKLOG_ACTIONS = ("use", "edit", "refresh", "discard", "next")
 TRENDSCHED_PREFIX = "trendsched:"
 TRENDSCHED_ACTIONS = ("best", "now", "choose", "confirm", "cancel")
 
+# Task 2C — DM approval (Threads DMs gated by Telegram approval).
+DMOPP_PREFIX = "dmopp:"
+DMOPP_ACTIONS = ("approve", "edit", "reject")
+
 # Session "kind" markers stored in the PendingEditStore card_message_id field so
 # the generic text interceptor can route them to the right handler.
 SCHED_INPUT_KIND = "trendsched:input"
@@ -143,6 +147,56 @@ def backlog_card_text(item: dict[str, Any]) -> str:
         f"URL: {permalink}",
         "",
         f"Draft ({len(draft)} chars):\n{preview}",
+    ]
+    return "\n".join(lines)
+
+
+def dm_approval_keyboard(opportunity_id: int) -> dict[str, Any]:
+    """Approve/Edit/Reject keyboard for one DM opportunity card."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Approve", "callback_data": f"dmopp:approve:{opportunity_id}"},
+                {"text": "✏️ Edit", "callback_data": f"dmopp:edit:{opportunity_id}"},
+            ],
+            [
+                {"text": "❌ Reject", "callback_data": f"dmopp:reject:{opportunity_id}"},
+            ],
+        ]
+    }
+
+
+def dm_approval_card_text(opp: dict[str, Any]) -> str:
+    """Approval card body for one DM opportunity. No credentials, no JSON dump —
+    just enough context for a human to decide."""
+    username = opp.get("from_username") or "unknown"
+    root = (opp.get("root_post_text") or "(original post text unavailable)").strip()
+    root_excerpt = root if len(root) <= 200 else root[:197] + "..."
+    reply = (opp.get("reply_text") or "(their reply text unavailable)").strip()
+    reply_excerpt = reply if len(reply) <= 280 else reply[:277] + "..."
+    intent = opp.get("intent") or "(unknown)"
+    lead = opp.get("lead_score")
+    lead_str = f"{float(lead):.2f}" if isinstance(lead, (int, float)) else "n/a"
+    cta = (opp.get("cta_matched") or "").strip()
+    draft = (opp.get("dm_draft_text") or "(no draft)").strip()
+
+    lines = [
+        "📩 DM APPROVAL",
+        "",
+        f"Opportunity #{opp.get('id')}  •  account @{opp.get('account_key')}",
+        f"To: @{username}",
+        "",
+        f"Their reply:\n{reply_excerpt}",
+        "",
+        f"Intent: {intent}  •  lead score {lead_str}",
+    ]
+    if cta:
+        lines.append(f"CTA matched: {cta}")
+    lines += [
+        "",
+        f"Root post: {root_excerpt}",
+        "",
+        f"Proposed DM ({len(draft)} chars):\n{draft}",
     ]
     return "\n".join(lines)
 
@@ -497,6 +551,139 @@ class OwnReplyDispatcher(_BaseWorkflowDispatcher):
     edit_prompt = "Send the new reply text, or 'cancel'."
 
 
+class DMDispatcher(_BaseWorkflowDispatcher):
+    """Task 2C: dmopp: callbacks -> own-replies dm CLI subcommands.
+
+    Stops at ``approved`` (or a terminal rejection) — it never sends a DM.
+    The base class already owns: callback parsing, the PendingEditStore edit
+    session (30-min expiry, restart-safe), empty/cancel handling, and the
+    CLI subprocess boundary. This subclass only customises messaging and the
+    post-edit card refresh.
+    """
+
+    group = "own-replies"
+    prefix = DMOPP_PREFIX
+    actions = DMOPP_ACTIONS
+    edit_prompt = (
+        "Send the replacement DM text, or 'cancel'. "
+        "Approving is a separate step — editing never sends."
+    )
+
+    async def _start_edit(
+        self, row_id: int, *, chat_id: str, user_id: str, answer: AnswerFn | None
+    ) -> None:
+        # Tag the session so the card refresh can edit the original card
+        # message in place when the user submits replacement text.
+        session = self.store.create(
+            chat_id=chat_id, user_id=user_id, engagement_id=row_id,
+            account_key=self.account,
+        )
+        session["card_message_id"] = session.get("card_message_id")
+        await self._answer(
+            answer,
+            f"✏️ Edit DM for opportunity #{row_id}. {self.edit_prompt}",
+        )
+
+    async def _decide(
+        self, row_id: int, action: str, *, chat_id: str, message_id: str | None, answer: AnswerFn | None
+    ) -> None:
+        ref = f"tg:{chat_id}:{message_id}" if message_id else f"tg:{chat_id}"
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            ["dm", action, "--account", self.account, "--id", str(row_id), "--approval-ref", ref],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            err = _err(payload)
+            # Stale / replayed callback: already decided or expired. Answer
+            # informatively; never surface as a hard failure to the user.
+            if payload.get("already_decided"):
+                await self._answer(
+                    answer,
+                    f"ℹ️ #{row_id} already {payload.get('status', 'decided')} — nothing changed.",
+                )
+                return
+            if "expired" in err.lower():
+                await self._answer(
+                    answer,
+                    f"⏰ Opportunity #{row_id} has expired and can no longer be {action}d.",
+                )
+                return
+            await self._answer(answer, f"❌ {action.title()} failed: {err}")
+            return
+        status = payload.get("status", action)
+        if action == "approve":
+            note = (
+                f"✅ DM opportunity #{row_id} approved.\n"
+                "It will be sent by the DM sender (Task 2D) — no DM has been sent yet."
+            )
+        elif action == "reject":
+            note = f"❌ DM opportunity #{row_id} rejected."
+        else:
+            note = f"✅ #{row_id}: {action} recorded ({status})."
+        await self._answer(answer, note)
+        # Strip the buttons off the decided card if we can edit it in place.
+        if self._edit is not None and message_id:
+            try:
+                await self._edit(str(chat_id), str(message_id), note, None)
+            except Exception:  # noqa: BLE001
+                logger.warning("dm card edit-after-decide failed", exc_info=True)
+
+    async def handle_text(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        text: str,
+        answer: AnswerFn | None = None,
+    ) -> bool:
+        session = self.store.find_for_sender(chat_id=str(chat_id), user_id=str(user_id))
+        if session is None:
+            return False
+        row_id = int(session["engagement_id"])
+        body = (text or "").strip()
+        if body.lower() in CANCEL_WORDS:
+            self.store.remove(session["token"])
+            await self._send(text=f"✏️ DM edit cancelled for #{row_id}. Draft unchanged.")
+            return True
+        if not body:
+            await self._send(
+                text="Replacement DM text is empty — send the new text, or 'cancel'."
+            )
+            return True
+        code, payload = await _run_cli(
+            self.cli_argv, self.group,
+            ["dm", "edit", "--account", self.account, "--id", str(row_id), "--text", body],
+            cwd=self.cwd,
+        )
+        if code != 0 or not payload.get("ok"):
+            err = _err(payload)
+            lower = err.lower()
+            if payload.get("already_decided") or "not awaiting" in lower or "expired" in lower:
+                self.store.remove(session["token"])
+                await self._send(
+                    text=f"⚠️ #{row_id} is no longer awaiting edits ({err}); edit session closed."
+                )
+            else:
+                await self._send(
+                    text=f"❌ DM edit failed for #{row_id}: {err} — session still open; send new text or 'cancel'."
+                )
+            return True
+        self.store.remove(session["token"])
+        await self._send(
+            text=f"✏️ DM draft for #{row_id} updated — still awaiting approval. Review the refreshed card."
+        )
+        # Send the refreshed approval card with the edited draft.
+        refreshed = (payload.get("dm_draft_text") or body)
+        card = payload.get("card_text") or f"Proposed DM ({len(refreshed)} chars):\n{refreshed}"
+        await self._send(
+            str(chat_id),
+            card,
+            markup=dm_approval_keyboard(row_id),
+        )
+        return True
+
+
 class TrendBacklogDispatcher(_BaseWorkflowDispatcher):
     """Workflow A backlog: backlog: callbacks -> trend-engagement CLI group."""
 
@@ -621,6 +808,10 @@ class TrendEngagementTelegramBridge(TrendEngagementDispatcher):
 
 class OwnReplyTelegramBridge(OwnReplyDispatcher):
     """Gateway-compatible alias for Workflow B."""
+
+
+class DMTelegramBridge(DMDispatcher):
+    """Gateway-compatible alias for Task 2C DM approval."""
 
 
 class TrendBacklogTelegramBridge(TrendBacklogDispatcher):
