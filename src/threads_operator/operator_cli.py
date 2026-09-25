@@ -2081,6 +2081,17 @@ def _dm_page(config: AccountConfig):
     return dm_browser.ThreadsDMPage(Path(profile).expanduser())
 
 
+def _dm_expected_username(config: AccountConfig) -> str | None:
+    """The account's real Threads username for browser-login verification.
+
+    Read from optional config ``THREADS_USERNAME``. When unset, returns None so
+    the sender falls back to the account_key label (legacy behaviour). Set this
+    to the actual Threads handle (e.g. ``syaqir_sharani``) so account
+    verification compares against the real login, not the operator label."""
+    val = (config.get("THREADS_USERNAME", "") or "").strip().lstrip("@")
+    return val or None
+
+
 def _dm_result_payload(config: AccountConfig, res, *, code: int = 0) -> tuple[int, dict[str, Any]]:
     payload = {
         "ok": res.ok, "account": config.name,
@@ -2105,7 +2116,9 @@ def _run_dm_send(
     worker = worker_id or f"cli-{os.getpid()}"
     page = _dm_page(config)
     try:
-        res = dm_send.send_dm_opportunity(store, opportunity_id, page=page, worker_id=worker)
+        res = dm_send.send_dm_opportunity(
+            store, opportunity_id, page=page, worker_id=worker,
+            expected_account_username=_dm_expected_username(config))
     finally:
         page.close()
     return _dm_result_payload(config, res)

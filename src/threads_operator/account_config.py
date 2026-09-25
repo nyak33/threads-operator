@@ -30,6 +30,10 @@ DEFAULT_ACCOUNT_VALUES: dict[str, str] = {
     "THREADS_EXECUTION_MODE": "approval_required",
     "THREADS_QUEUE_TABLE": "threads_publish_queue",
     "THREADS_QUEUE_CAMPAIGN_CODE": "",
+    # Optional: the account's real Threads username (e.g. "syaqir_sharani").
+    # Used by the DM sender to verify the browser is logged into the exact
+    # account. Distinct from the account_key label (env-file name).
+    "THREADS_USERNAME": "",
 }
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}

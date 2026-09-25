@@ -47,7 +47,21 @@ class _JS:
     # Who is logged in? Reads the profile nav / viewer link. Returns username or null.
     WHOAMI = r"""
 (() => {
-  // The nav "Profile" link points at /<username>; most reliable account signal.
+  // The logged-in account is most reliably read from the "/@<username>" links
+  // Threads renders for the signed-in user (own-profile / own-avatar links).
+  // These use the "/@" prefix; utility links ("/search", "/messages", "/")
+  // never do. Prefer the most frequent "/@user" href — that is the account.
+  const counts = new Map();
+  document.querySelectorAll('a[href^="/@"]').forEach(a => {
+    const m = (a.getAttribute('href')||'').match(/^\/@([A-Za-z0-9._]+)\/?$/);
+    if (m) counts.set(m[1], (counts.get(m[1])||0)+1);
+  });
+  if (counts.size) {
+    let best = null, bestN = -1;
+    for (const [u,n] of counts) if (n > bestN) { best = u; bestN = n; }
+    return best;
+  }
+  // Fallback: a nav "Profile" link aria-labeled as such, href "/@user" or "/user".
   const links = Array.from(document.querySelectorAll('a[href]'));
   for (const a of links) {
     const aria = (a.getAttribute('aria-label')||'').toLowerCase();
@@ -56,10 +70,7 @@ class _JS:
       if (m) return m[1];
     }
   }
-  // Fallback: any href that is exactly /<username> under the nav region.
-  const m2 = links.map(a=>a.getAttribute('href')||'')
-                  .find(h=>/^\/@?[A-Za-z0-9._]+\/?$/.test(h) && !h.includes('/post/'));
-  return m2 ? m2.replace(/^\/@?/,'').replace(/\/$/,'') : null;
+  return null;
 })()
 """
 

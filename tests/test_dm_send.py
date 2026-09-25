@@ -337,6 +337,62 @@ def test_account_cannot_be_determined_fails_closed():
     assert page.sent_messages == []
 
 
+def test_account_verified_against_threads_username_not_account_key():
+    """The browser login must match the account's real Threads username
+    (THREADS_USERNAME), which differs from the account_key label. Production
+    case: account_key 'syaqir' vs username 'syaqir_sharani'. Without the
+    override, the legitimate account is falsely rejected."""
+    from threads_operator import dm_send
+    store, fake = make_store([seed_row()])  # account_key = "syaqir"
+    patch_transport(store, fake)
+    # Browser logged into the REAL Threads username.
+    page = FakePage(logged_in_user="syaqir_sharani")
+    res = dm_send.send_dm_opportunity(
+        store, OID, page=page, worker_id="w1",
+        expected_account_username="syaqir_sharani")
+    assert res.ok is True, res.detail
+    assert page.sent_messages != []
+
+
+def test_account_override_wrong_login_still_fails_closed():
+    """Even with the override, a wrong browser login must fail closed."""
+    from threads_operator import dm_send
+    store, fake = make_store([seed_row()])
+    patch_transport(store, fake)
+    page = FakePage(logged_in_user="someone_else")
+    res = dm_send.send_dm_opportunity(
+        store, OID, page=page, worker_id="w1",
+        expected_account_username="syaqir_sharani")
+    assert res.ok is False
+    assert res.failure_category == "account_mismatch"
+    assert page.sent_messages == []
+
+
+def test_account_override_case_and_at_normalized():
+    """Username comparison tolerates case / leading-@ differences."""
+    from threads_operator import dm_send
+    store, fake = make_store([seed_row()])
+    patch_transport(store, fake)
+    page = FakePage(logged_in_user="@Syaqir_Sharani")
+    res = dm_send.send_dm_opportunity(
+        store, OID, page=page, worker_id="w1",
+        expected_account_username="syaqir_sharani")
+    assert res.ok is True, res.detail
+
+
+def test_account_key_label_differs_from_username_would_fail_without_override():
+    """Documents the production defect: comparing against account_key 'syaqir'
+    while the browser is logged in as 'syaqir_sharani' (no override) fails
+    closed. The override is the fix."""
+    from threads_operator import dm_send
+    store, fake = make_store([seed_row()])
+    patch_transport(store, fake)
+    page = FakePage(logged_in_user="syaqir_sharani")
+    res = dm_send.send_dm_opportunity(store, OID, page=page, worker_id="w1")  # no override
+    assert res.ok is False
+    assert res.failure_category == "account_mismatch"
+
+
 # ===========================================================================
 # 4. AUTH / CHALLENGE fail closed
 # ===========================================================================

@@ -192,11 +192,18 @@ def claim_dm_opportunity(store, opportunity_id: int, worker_id: str) -> dict | N
 
 
 # --------------------------------------------------------------------------- helpers
-def _verify_account(page: DMPage, expected_account: str) -> None:
+def _verify_account(page: DMPage, expected_username: str) -> None:
+    """The browser must be logged in as the account's Threads username.
+
+    ``expected_username`` is the real Threads username (config
+    ``THREADS_USERNAME``), NOT the operator account_key label — comparing the
+    browser login against the account_key label would falsely reject the
+    legitimate account (e.g. account_key ``syaqir`` vs username
+    ``syaqir_sharani``)."""
     who = page.current_logged_in_username()
-    if not who or _norm_username(who) != _norm_username(expected_account):
+    if not who or _norm_username(who) != _norm_username(expected_username):
         raise SendAborted(CAT_ACCOUNT_MISMATCH,
-                          f"browser account {who!r} != opportunity account {expected_account!r}")
+                          f"browser account {who!r} != expected Threads username {expected_username!r}")
 
 
 def _check_challenge(page: DMPage) -> None:
@@ -238,12 +245,18 @@ def send_dm_opportunity(
     *,
     page: DMPage,
     worker_id: str,
+    expected_account_username: str | None = None,
 ) -> SendResult:
     """Claim and send one approved DM opportunity through the browser page.
 
     Deterministic given the page; all branching is fail-closed. Never sends a
     non-approved row, never sends to an unverified recipient, never sends text
     that differs from the persisted approved text, and never resends a sent row.
+
+    ``expected_account_username`` is the account's real Threads username (from
+    config ``THREADS_USERNAME``); when omitted it falls back to the row's
+    ``account_key`` for backward compatibility. Account verification compares
+    the browser login against THIS username, not the operator account label.
     """
     elig = check_eligibility(store, opportunity_id)
     base = SendResult(ok=False, opportunity_id=opportunity_id)
@@ -256,6 +269,7 @@ def send_dm_opportunity(
     account = row.get("account_key") or ""
     target = row.get("target_threads_username") or ""
     approved_text = row.get("dm_approved_text") or ""
+    expected_username = expected_account_username or account
     base.account = account
     base.target_username = target
     base.text_hash = text_hash(approved_text)
@@ -269,7 +283,7 @@ def send_dm_opportunity(
 
     try:
         _check_challenge(page)
-        _verify_account(page, account)
+        _verify_account(page, expected_username)
         canonical = _resolve_recipient(page, target)
         try:
             thread_id = page.open_conversation(canonical)
