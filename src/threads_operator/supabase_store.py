@@ -1869,6 +1869,7 @@ class SupabaseStore:
     DM_OPPORTUNITY_STATUSES = frozenset({
         "detected", "drafted", "awaiting_approval", "approved",
         "sending", "sent", "rejected", "failed", "expired", "cancelled",
+        "send_uncertain",
     })
 
     def insert_dm_opportunity(self, payload: dict[str, Any]) -> dict[str, Any] | None:
