@@ -34,7 +34,7 @@ alter table public.threads_dm_opportunities
   add constraint threads_dm_opportunities_status_check
   check (status in (
     'detected','drafted','awaiting_approval','approved',
-    'sending','sent','rejected','cancelled','send_uncertain'
+    'sending','sent','rejected','failed','expired','cancelled','send_uncertain'
   ));
 
 -- 2) Atomic claim + send audit fields.
