@@ -168,6 +168,87 @@ def run_dm_approval_pass() -> dict:
     return {"dm_drafted": drafted, "dm_cards_sent": sent}
 
 
+def run_dm_send_pass() -> dict:
+    """Task 2D: browser-send approved DM opportunities (one per pass) and notify.
+
+    The Telegram approval callback persists state quickly; THIS worker performs
+    the actual browser send asynchronously so the callback never blocks on a
+    full automation run. Only approved rows are consumed (CLI enforces the
+    eligibility gate). Notifications go out for the three operator-relevant
+    outcomes — sent / failed / send_uncertain — never per internal retry.
+    """
+    code, listing = run_cli(["dm", "send-queue", "--limit", "1"], timeout=60)
+    if code != 0 or not listing.get("ok"):
+        return {"dm_send_attempted": 0, "dm_send_error": True}
+    approved = listing.get("approved") or []
+    if not approved:
+        return {"dm_send_attempted": 0}
+    oid = approved[0].get("id")
+    scode, res = run_cli(["dm", "send", "--id", str(oid)], timeout=600)
+    out = {"dm_send_attempted": 1}
+    if scode == 0 and res.get("ok"):
+        out["dm_sent"] = 1
+        _notify_dm_sent(res)
+    elif res.get("uncertain") or res.get("failure_category") == "send_uncertain":
+        out["dm_uncertain"] = 1
+        _notify_dm_uncertain(res)
+    else:
+        out["dm_failed"] = 1
+        _notify_dm_failed(res)
+    return out
+
+
+def _tg_send(text: str) -> None:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("TELEGRAM_BOT_TOKEN/CHAT_ID not set; DM notify skipped", file=sys.stderr)
+        return
+    body = json.dumps({"chat_id": CHAT_ID, "text": text[:4000]}).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data=body, headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20):
+            pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"telegram DM notify error: {exc}", file=sys.stderr)
+
+
+def _preview(text: str, n: int = 120) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    return t[:n] + ("…" if len(t) > n else "")
+
+
+def _notify_dm_sent(res: dict) -> None:
+    _tg_send(
+        f"✅ Threads DM SENT\n"
+        f"To: @{res.get('target_username')}\n"
+        f"Opportunity: #{res.get('id')}\n"
+        f"Confirmation: {res.get('confirmation_ref')}\n"
+        f"Preview: {_preview(res.get('dm_approved_text') or res.get('text_hash',''))}"
+    )
+
+
+def _notify_dm_failed(res: dict) -> None:
+    _tg_send(
+        f"⚠️ Threads DM FAILED\n"
+        f"To: @{res.get('target_username')}\n"
+        f"Opportunity: #{res.get('id')}\n"
+        f"Category: {res.get('failure_category')}\n"
+        f"Action: review `own-replies dm inspect --id {res.get('id')}`"
+    )
+
+
+def _notify_dm_uncertain(res: dict) -> None:
+    _tg_send(
+        f"❓ Threads DM delivery UNCERTAIN — auto-resend STOPPED\n"
+        f"To: @{res.get('target_username')}\n"
+        f"Opportunity: #{res.get('id')}\n"
+        f"The message may or may not have been delivered. Reconcile before retry:\n"
+        f"`own-replies dm reconcile --id {res.get('id')}`"
+    )
+
+
 def main() -> int:
     rc = 0
 
@@ -203,6 +284,11 @@ def main() -> int:
     if dm.get("dm_error"):
         rc = 1
 
+    # 4) Task 2D — browser-send approved DM opportunities (one per pass)
+    dms = run_dm_send_pass()
+    if dms.get("dm_send_error"):
+        rc = 1
+
     print(json.dumps({
         "new_replies": payload.get("new_replies", 0) if payload else 0,
         "proposed": payload.get("proposed_count", 0) if payload else 0,
@@ -210,6 +296,10 @@ def main() -> int:
         "failed": pub.get("failed", 0) if pub else 0,
         "dm_drafted": dm.get("dm_drafted", 0),
         "dm_cards_sent": dm.get("dm_cards_sent", 0),
+        "dm_send_attempted": dms.get("dm_send_attempted", 0),
+        "dm_sent": dms.get("dm_sent", 0),
+        "dm_send_failed": dms.get("dm_failed", 0),
+        "dm_send_uncertain": dms.get("dm_uncertain", 0),
     }))
     return rc
 

@@ -411,6 +411,33 @@ def _parser() -> argparse.ArgumentParser:
     ownreply_dm_needing.add_argument("--account")
     ownreply_dm_needing.add_argument("--limit", type=int, default=50)
 
+    # --- Task 2D: browser DM send (consumes only approved) ---
+    ownreply_dm_send = ownreply_dm_sub.add_parser(
+        "send", help="claim + browser-send ONE approved DM opportunity by id")
+    ownreply_dm_send.add_argument("--account")
+    ownreply_dm_send.add_argument("--id", type=int, required=True)
+    ownreply_dm_send.add_argument("--worker-id", default=None)
+
+    ownreply_dm_next = ownreply_dm_sub.add_parser(
+        "send-next", help="claim + browser-send the next approved opportunity")
+    ownreply_dm_next.add_argument("--account")
+    ownreply_dm_next.add_argument("--worker-id", default=None)
+
+    ownreply_dm_list = ownreply_dm_sub.add_parser(
+        "send-queue", help="list approved / sending / send_uncertain opportunities")
+    ownreply_dm_list.add_argument("--account")
+    ownreply_dm_list.add_argument("--limit", type=int, default=50)
+
+    ownreply_dm_inspect = ownreply_dm_sub.add_parser(
+        "inspect", help="show the send state of one opportunity")
+    ownreply_dm_inspect.add_argument("--account")
+    ownreply_dm_inspect.add_argument("--id", type=int, required=True)
+
+    ownreply_dm_reconcile = ownreply_dm_sub.add_parser(
+        "reconcile", help="resolve a send_uncertain opportunity via the browser")
+    ownreply_dm_reconcile.add_argument("--account")
+    ownreply_dm_reconcile.add_argument("--id", type=int, required=True)
+
     return parser
 
 
@@ -2047,6 +2074,106 @@ def _run_ownreply_edit(
 # None of them send a DM. Every mutation is CAS-guarded and account-scoped in
 # the store; a stale or cross-account call returns a clear non-zero payload.
 
+def _dm_page(config: AccountConfig):
+    """Build the live browser page for DM sending (ThreadsDMPage)."""
+    from . import dm_browser
+    profile = config.get("THREADS_BROWSER_PROFILE", "") or "~/.threads-operator/browser-profiles/syaqir"
+    return dm_browser.ThreadsDMPage(Path(profile).expanduser())
+
+
+def _dm_result_payload(config: AccountConfig, res, *, code: int = 0) -> tuple[int, dict[str, Any]]:
+    payload = {
+        "ok": res.ok, "account": config.name,
+        "id": res.opportunity_id, "status": "sent" if res.sent else None,
+        "attempt": res.attempt, "confirmation_ref": res.confirmation_ref,
+        "text_hash": res.text_hash, "target_username": res.target_username,
+    }
+    if not res.ok:
+        payload["error"] = res.detail
+        payload["failure_category"] = res.failure_category
+        payload["uncertain"] = res.uncertain
+        code = code or 1
+    return (0 if res.ok else (code or 1)), payload
+
+
+def _run_dm_send(
+    config: AccountConfig, *, opportunity_id: int, worker_id: str | None
+) -> tuple[int, dict[str, Any]]:
+    """Claim + browser-send one approved DM opportunity. Fail-closed."""
+    from . import dm_send
+    store = _store(config)
+    worker = worker_id or f"cli-{os.getpid()}"
+    page = _dm_page(config)
+    try:
+        res = dm_send.send_dm_opportunity(store, opportunity_id, page=page, worker_id=worker)
+    finally:
+        page.close()
+    return _dm_result_payload(config, res)
+
+
+def _run_dm_send_next(
+    config: AccountConfig, *, worker_id: str | None
+) -> tuple[int, dict[str, Any]]:
+    """Send the next approved opportunity (oldest first). No-op if none."""
+    from . import dm_send
+    store = _store(config)
+    rows = store.list_dm_opportunities(status="approved", limit=1)
+    if not rows:
+        return 0, {"ok": True, "account": config.name, "sent": 0,
+                   "note": "no approved opportunities"}
+    oid = rows[0]["id"]
+    return _run_dm_send(config, opportunity_id=oid, worker_id=worker_id)
+
+
+def _run_dm_send_queue(config: AccountConfig, *, limit: int) -> tuple[int, dict[str, Any]]:
+    """List the send-relevant opportunities (approved/sending/send_uncertain)."""
+    store = _store(config)
+    out = {"ok": True, "account": config.name}
+    for st in ("approved", "sending", "send_uncertain"):
+        rows = store.list_dm_opportunities(status=st, limit=limit)
+        out[st] = [
+            {"id": r.get("id"), "status": r.get("status"),
+             "target": r.get("target_threads_username"),
+             "attempt_count": r.get("attempt_count"),
+             "claim_id": r.get("claim_id"),
+             "failure_category": r.get("failure_category"),
+             "sent_at": r.get("sent_at")}
+            for r in rows
+        ]
+    return 0, out
+
+
+def _run_dm_inspect(config: AccountConfig, *, opportunity_id: int) -> tuple[int, dict[str, Any]]:
+    store = _store(config)
+    row = store.get_dm_opportunity(opportunity_id)
+    if row is None:
+        return 2, {"ok": False, "account": config.name,
+                   "error": f"DM opportunity {opportunity_id} not found (or not this account)"}
+    keys = ("id", "status", "target_threads_username", "attempt_count", "claim_id",
+            "claimed_at", "last_attempt_at", "sent_at", "external_dm_id",
+            "confirmation_ref", "confirmation_evidence", "failure_category",
+            "last_error", "sent_text_hash", "dm_approved_text")
+    return 0, {"ok": True, "account": config.name,
+               "opportunity": {k: row.get(k) for k in keys}}
+
+
+def _run_dm_reconcile(
+    config: AccountConfig, *, opportunity_id: int
+) -> tuple[int, dict[str, Any]]:
+    """Resolve a send_uncertain opportunity via the browser (no resend)."""
+    from . import dm_send
+    store = _store(config)
+    page = _dm_page(config)
+    try:
+        res = dm_send.reconcile_dm_opportunity(store, opportunity_id, page=page)
+    finally:
+        page.close()
+    return (0 if res.resolved else 1), {
+        "ok": res.resolved, "account": config.name, "id": opportunity_id,
+        "outcome": res.outcome, "can_retry": res.can_retry, "detail": res.detail,
+    }
+
+
 def _run_dm_draft(
     config: AccountConfig, *, opportunity_id: int
 ) -> tuple[int, dict[str, Any]]:
@@ -2529,6 +2656,16 @@ def main(
             )
         elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "needing-card":
             code, payload = _run_dm_needing_card(config, limit=args.limit)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "send":
+            code, payload = _run_dm_send(config, opportunity_id=args.id, worker_id=args.worker_id)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "send-next":
+            code, payload = _run_dm_send_next(config, worker_id=args.worker_id)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "send-queue":
+            code, payload = _run_dm_send_queue(config, limit=args.limit)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "inspect":
+            code, payload = _run_dm_inspect(config, opportunity_id=args.id)
+        elif args.command == "own-replies" and args.ownreply_command == "dm" and args.dm_command == "reconcile":
+            code, payload = _run_dm_reconcile(config, opportunity_id=args.id)
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except AccountConfigError as exc:
