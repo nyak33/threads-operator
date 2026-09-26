@@ -1984,6 +1984,29 @@ def _run_ownreply_scan(
         persona_text = trend_engagement.load_persona(_personas_root(), config.name)
         for row in new_rows:
             try:
+                # Task 2A/2B live wiring: classify every newly discovered reply
+                # before the public-reply approval transition. Classification
+                # persists structured context/intent and may idempotently create
+                # a DM opportunity; it never sends a DM.
+                try:
+                    intelligence = own_replies.classify_reply(
+                        store=store,
+                        account_key=config.name,
+                        reply_row=row,
+                        persona_text=persona_text,
+                    )
+                    updated = intelligence.get("updated_row")
+                    if isinstance(updated, dict):
+                        row = {**row, **updated}
+                except Exception as exc:  # noqa: BLE001
+                    # Fail closed for the DM/lead path without breaking the
+                    # pre-existing public-reply workflow.
+                    logger.warning(
+                        "reply classification failed for row %s: %s",
+                        row.get("id"),
+                        exc,
+                    )
+
                 draft = own_replies.generate_reply_draft(
                     persona_text=persona_text,
                     parent_post_text=row.get("parent_post_text"),
