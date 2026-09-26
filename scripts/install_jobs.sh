@@ -38,6 +38,25 @@ fi
 PY="${ROOT_DIR}/.venv/bin/python"
 [ -x "$PY" ] || PY="python3"
 
+# Sync operator watchdog scripts into HERMES_HOME/scripts/. The Hermes cron scheduler
+# refuses to run any script that resolves outside HERMES_HOME/scripts/ (traversal/symlink
+# guard), so the repo copies there must be refreshed on every install to pick up repo
+# changes. No secrets are involved — these are plain Python sources already in git.
+if [ "$MODE" != "remove" ]; then
+  HERMES_SCRIPTS_DIR="${HERMES_SCRIPTS_DIR:-$HOME/.hermes/scripts}"
+  mkdir -p "$HERMES_SCRIPTS_DIR"
+  for src in "$ROOT_DIR"/scripts/*watchdog*.py; do
+    [ -f "$src" ] || continue
+    base="$(basename "$src")"
+    dest="$HERMES_SCRIPTS_DIR/$base"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      cmp -s "$src" "$dest" 2>/dev/null || echo "WOULD-SYNC $base -> $HERMES_SCRIPTS_DIR/"
+    elif ! cmp -s "$src" "$dest" 2>/dev/null; then
+      cp "$src" "$dest" && chmod 700 "$dest" && echo "SYNCED   $base -> $HERMES_SCRIPTS_DIR/"
+    fi
+  done
+fi
+
 # One Python pass renders the manifest, matches existing jobs from the durable
 # store, and prints an action plan (shell-safe lines) for bash to execute.
 PLAN="$(HERMES_JOBS_JSON="$JOBS_JSON" "$PY" - "$MANIFEST" "$ACCOUNT" "$ROOT_DIR" "$MODE" <<'PY'

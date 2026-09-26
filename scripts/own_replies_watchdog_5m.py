@@ -22,11 +22,42 @@ import urllib.request
 from pathlib import Path
 
 REPO = os.environ.get("THREADS_OPERATOR_REPO", str(Path(__file__).resolve().parent.parent))
+# Make the threads_operator package importable so we can route Telegram delivery through the
+# Hermes gateway loopback endpoint (Hermes strips TELEGRAM_BOT_TOKEN from spawned subprocesses).
+sys.path.insert(0, os.path.join(REPO, "src"))
 CLI = [".venv/bin/threads-operator", "own-replies"]
 ACCOUNT = os.environ.get("THREADS_ACCOUNT", "syaqir")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+def _hermes_env_value(key: str) -> str:
+    """Read one key from the Hermes-owned ~/.hermes/.env (mode 600, same uid). Hermes strips these
+    vars from our spawned env, so the chat id must be read from the file directly. Never logged."""
+    path = os.path.join(os.environ.get("HERMES_HOME", "").strip() or os.path.expanduser("~/.hermes"), ".env")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _resolve_chat_id() -> str:
+    """Prefer process env (manual runs), else the Hermes env's channel id (cron path)."""
+    return (
+        os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        or _hermes_env_value("TELEGRAM_CHAT_ID")
+        or _hermes_env_value("TELEGRAM_HOME_CHANNEL")
+    )
+
+
+CHAT_ID = _resolve_chat_id()
 
 
 def send_card(text: str, row_id: int) -> None:
@@ -72,9 +103,34 @@ def _send_message(text: str, keyboard: dict) -> str | None:
 
     The ref is what makes the DM approval card idempotent: it is stamped on the
     opportunity row, and a row that already has one is never re-sent a card.
+
+    Delivery path: the Hermes gateway loopback endpoint owns the bot token and the
+    inline keyboard. Hermes strips TELEGRAM_BOT_TOKEN from this (spawned) process, so
+    the gateway path is the only one that works under cron. A locally-present token
+    (manual run with creds exported) falls back to the direct Bot API call.
     """
-    if not BOT_TOKEN or not CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN/CHAT_ID not set; DM card not sent", file=sys.stderr)
+    if not CHAT_ID:
+        print("TELEGRAM_CHAT_ID/TELEGRAM_HOME_CHANNEL not resolvable; DM card not sent", file=sys.stderr)
+        return None
+    # Preferred: gateway loopback (tokenless for us; the gateway holds the token).
+    try:
+        from threads_operator import telegram_gateway
+        if telegram_gateway.gateway_card_send_available():
+            try:
+                message_id = telegram_gateway.send_telegram_card(
+                    chat_id=CHAT_ID,
+                    text=text[:4000],
+                    inline_keyboard=keyboard.get("inline_keyboard"),
+                )
+                return f"{CHAT_ID}:{message_id}"
+            except telegram_gateway.TelegramGatewayError as exc:
+                print(f"gateway DM card send failed: {exc}", file=sys.stderr)
+                return None
+    except ImportError:
+        pass  # threads_operator not importable; fall through to legacy token path
+    # Fallback: direct Bot API when a token happens to be present (manual run).
+    if not BOT_TOKEN:
+        print("gateway card send unavailable and TELEGRAM_BOT_TOKEN not set; DM card not sent", file=sys.stderr)
         return None
     body = json.dumps({
         "chat_id": CHAT_ID,
