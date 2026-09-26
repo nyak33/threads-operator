@@ -129,6 +129,31 @@ def create_dm_opportunity(
             error="Missing root_post_id or reply_username — cannot create DM opportunity",
         )
 
+    # Resolve the persisted own-reply row first. Production schema requires
+    # source_own_reply_id as a NOT NULL FK, so the opportunity insert must carry
+    # the real row id rather than trying to link it only afterwards.
+    source_row = store.get_own_reply_by_reply_id(context.reply_id)
+    if (
+        not source_row
+        or source_row.get("account_key") != account_key
+        or source_row.get("id") is None
+    ):
+        return DMOppotunityResult(
+            success=False,
+            opportunity_id=None,
+            status=None,
+            error="Persisted own-reply row missing or account mismatch",
+        )
+    try:
+        source_own_reply_id = int(source_row["id"])
+    except (TypeError, ValueError):
+        return DMOppotunityResult(
+            success=False,
+            opportunity_id=None,
+            status=None,
+            error="Persisted own-reply row has invalid id",
+        )
+
     # Compute expiry
     expires_at = datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
 
@@ -136,7 +161,7 @@ def create_dm_opportunity(
     payload = {
         "account_key": account_key,
         "source_reply_id": context.reply_id,
-        "source_own_reply_id": 0,  # Will be set by caller after upserting reply row
+        "source_own_reply_id": source_own_reply_id,
         "from_username": context.reply_username,
         "root_post_id": context.root_post_id,
         "root_post_permalink": context.root_post_permalink,
@@ -149,10 +174,6 @@ def create_dm_opportunity(
         "status": DM_STATUS_DETECTED,
         "expires_at": expires_at.isoformat(),
     }
-
-    # Remove the source_own_reply_id placeholder — the caller sets it
-    # after the own_reply row is confirmed
-    payload.pop("source_own_reply_id", None)
 
     try:
         # Use the store's insert method (idempotent via unique constraint)
