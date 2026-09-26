@@ -90,6 +90,29 @@ Portable multi-account runtime with approval-gated engagement and account-scoped
 - Live readiness + controlled verification: `docs/task2d-live-readiness.md`.
 - `tests/test_dm_send.py` (29) + `test_dm_browser.py` (17) + `test_dm_send_cli.py` (8) + `test_dm_send_watchdog.py` (5). Full suite **758 passed, 1 skipped**; Task 2A/2B/2C + public reply workflow remain green.
 
+## Superpower Task #3 — Telegram Approval → Smart Scheduling → Publish Queue (DONE, 2026-09-26)
+
+- Trend candidate → Hermes-generated draft → Telegram approval card → operator approves → scheduling card (⭐ Best Time / ⚡ Post Now / 🕐 Choose Time / Cancel) → approved publish-queue row with `scheduled_at` → candidate marked `queued` with `used_in_queue_id` link.
+- `src/threads_operator/scheduling.py`: deterministic best-time scheduler — historical (day_of_week, hour) MYT engagement buckets (min 2 samples, 90-day window), collision avoidance (60-min gap) against occupied approved/scheduled queue rows, configured-window fallback, never-fail lead-time last resort.
+- Hermes gateway Telegram adapter: `trendsched:` callback bridge (`_get_trend_sched_bridge`, `_handle_trend_sched_callback`, `TrendSchedTelegramBridge`) routes scheduling taps to the threads-operator CLI subprocess (hermes-agent commits `ad9e733c`, `edb43e6f`).
+- threads-operator commits `668c1ba` (Telegram approval routing), `7d88925` (smart scheduling service integration) + gateway test suite 667 passed.
+
+### Live E2E verification (2026-09-26, production)
+
+- Candidate **#152** (`pending_approval`) → Telegram approval card sent (message ref `79553451:6001`) → operator pressed **✅ Approve** → scheduling card appeared → operator pressed **⭐ Use Best Time** → queue row **#600** created.
+- Verified post-tap state (all read-back from production Supabase):
+  - Candidate #152: `status=queued`, `used_in_queue_id=600`, exactly one candidate points at queue 600.
+  - Queue #600: `status=approved`, `scheduled_at=2026-10-02T17:00:00+00:00` persisted — converts exactly to **Sat 03 Oct 2026, 1:00 AM Asia/Kuala_Lumpur**, matching the Telegram confirmation display. No UTC/MYT error.
+  - Full approved draft text persisted byte-identically (353 chars); the Telegram card's 199-char "Draft" preview is display truncation only — no content loss.
+  - No duplicate queue row: only queue 600 created in the callback window; `created_at == updated_at` (single creation, never re-touched).
+- Scheduler evidence (decision reproduced deterministically with the same 90-day insight history and occupied-slot set at decision time):
+  - Source: **historical** (not fallback). Bucket: **Saturday 01:00 MYT**, mean engagement score **0.0498**, **n=2** backing posts (2026-09-19 Sat 01:00, 2026-09-26 Sat 01:00).
+  - Higher-ranked bucket #1 (Tue 20:00 MYT, score 0.1415, n=3) was rejected: next occurrence Tue 29 Sep 20:00 collided with approved queue #598 (60-min min-gap rule).
+  - Nearest occupied slots to the chosen slot: Fri 02 Oct 21:45 MYT (−3.2h) and Sat 03 Oct 21:45 MYT (+20.8h) — spacing clear.
+  - 88 occupied approved/scheduled slots were considered for collision; 19 trusted buckets ranked.
+- Gateway logs for the callback window: zero entries (no traceback, no FileNotFoundError, no callback routing errors, no duplicate callback execution).
+- Result: **Task #3 closed.** Publish pipeline is: candidate → Approve → Best Time → approved queue row → existing publisher posts at `scheduled_at`.
+
 ## Deployment Next
 
 1. ~~Apply `migrations/002_post_daily_rollups.sql` to production Supabase~~ — DONE (externally verified 2026-09-23; table exists, RLS on, PK/indexes present; `rebuild_rollups.py` blocker cleared).
