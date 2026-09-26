@@ -606,6 +606,8 @@ class TestDMOpportunity:
         assert row["account_key"] == "syaqir"
         assert row["from_username"] == "commenter_one"
         assert row["root_post_id"] == "999888777"
+        assert row["source_own_reply_id"] == reply_row["id"]
+        assert row["expires_at"] is not None
         assert row["intent"] in (reply_intent.INTENT_CTA_MATCH, reply_intent.INTENT_POTENTIAL_LEAD)
 
     def test_dm_opportunity_dedup_same_user_same_post(self, store, backend):
