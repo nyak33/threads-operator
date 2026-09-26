@@ -167,22 +167,26 @@ def _is_cta_match(reply_text: str, post_cta: str | None, cta_patterns: tuple[str
     if not reply_matches:
         return False
 
-    # If the post has an explicit CTA, check alignment
+    # If the post has an explicit CTA, require actual lexical alignment
+    # between the reply trigger and that CTA. Do not count the fact that the
+    # trigger appears in the reply itself — that is tautological and caused
+    # unrelated comments containing generic words such as "boleh" or "link"
+    # to become false-positive DM opportunities.
     if post_cta:
         post_cta_lower = post_cta.lower()
-        # The reply should be semantically aligned with the CTA
         for pattern in reply_matches:
-            if pattern in post_cta_lower or pattern in reply_lower:
+            if pattern in post_cta_lower:
                 return True
 
-    # If no explicit post CTA, check configured CTA patterns
+    # Configured CTA patterns are an explicit operator allow-list. They may
+    # match a reply even when the CTA extractor did not recover the post CTA.
     for pattern in cta_patterns:
-        if pattern.lower() in reply_lower:
+        normalized = pattern.lower().strip()
+        if normalized and normalized in reply_lower:
             return True
 
-    # Fallback: reply matches a CTA reply pattern but no explicit alignment
-    # This is a weak signal — still counts as CTA match but with lower confidence
-    return True
+    # No proven alignment = no CTA match. Fail closed.
+    return False
 
 
 def classify_reply_intent(
