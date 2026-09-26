@@ -2026,11 +2026,44 @@ def _run_ownreply_scan(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("draft generation failed for row %s: %s", row.get("id"), exc)
 
+    # Task 2A/2B backfill: replies can already be pending_approval from an
+    # earlier watchdog tick/deployment while still lacking classification.
+    # Classify those rows without re-drafting or re-sending the public-reply
+    # approval card. This is idempotent and lets the DM approval pass consume
+    # newly-created opportunities in the same watchdog run.
+    classified_backfill = 0
+    try:
+        pending_unclassified = [
+            row for row in store.list_own_replies(status="pending_approval", limit=max(10, limit))
+            if row.get("classified_at") is None
+        ]
+        if pending_unclassified:
+            if "persona_text" not in locals():
+                persona_text = trend_engagement.load_persona(_personas_root(), config.name)
+            for row in pending_unclassified:
+                try:
+                    own_replies.classify_reply(
+                        store=store,
+                        account_key=config.name,
+                        reply_row=row,
+                        persona_text=persona_text,
+                    )
+                    classified_backfill += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "reply classification backfill failed for row %s: %s",
+                        row.get("id"),
+                        exc,
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reply classification backfill query failed: %s", exc)
+
     return 0, {
         "ok": True, "account": config.name,
         "posts_scanned": len(posts),
         "new_replies": len(new_rows),
         "proposed": proposed,
+        "classified_backfill": classified_backfill,
         "proposed_count": len(proposed),
     }
 
