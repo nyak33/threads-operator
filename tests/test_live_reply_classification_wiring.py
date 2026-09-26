@@ -31,3 +31,9 @@ def test_live_ownreply_scan_backfills_pending_unclassified_rows():
     assert 'list_own_replies(status="pending_approval"' in SOURCE
     assert 'row.get("classified_at") is None' in SOURCE
     assert '"classified_backfill": classified_backfill' in SOURCE
+
+
+def test_live_ownreply_scan_retries_classified_leads_missing_dm_opportunity():
+    assert 'row.get("dm_opportunity_id") is None' in SOURCE
+    for intent in ("cta_match", "buying_intent", "potential_lead"):
+        assert f'"{intent}"' in SOURCE
