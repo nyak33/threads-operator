@@ -479,7 +479,7 @@ class TestIntentClassification:
         )
         assert result.intent != reply_intent.INTENT_CTA_MATCH
         assert reply_intent.should_create_dm_opportunity(result) is False
-        assert result.dm_opportunity is True
+        assert result.dm_opportunity is False
 
     # Test 5: ambiguous reply
     def test_classify_ambiguous_reply(self):
