@@ -25,3 +25,9 @@ def test_live_ownreply_scan_calls_classify_reply():
         and node.func.attr == "classify_reply"
     ]
     assert calls, "_run_ownreply_scan must call own_replies.classify_reply()"
+
+
+def test_live_ownreply_scan_backfills_pending_unclassified_rows():
+    assert 'list_own_replies(status="pending_approval"' in SOURCE
+    assert 'row.get("classified_at") is None' in SOURCE
+    assert '"classified_backfill": classified_backfill' in SOURCE
