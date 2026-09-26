@@ -2035,7 +2035,13 @@ def _run_ownreply_scan(
     try:
         pending_unclassified = [
             row for row in store.list_own_replies(status="pending_approval", limit=max(10, limit))
-            if row.get("classified_at") is None
+            if (
+                row.get("classified_at") is None
+                or (
+                    row.get("dm_opportunity_id") is None
+                    and row.get("intent") in {"cta_match", "buying_intent", "potential_lead"}
+                )
+            )
         ]
         if pending_unclassified:
             if "persona_text" not in locals():
