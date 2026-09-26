@@ -87,7 +87,7 @@ _BUYING_PATTERNS = frozenset({
 # checked against the post's CTA. A reply that matches a CTA pattern
 # from the post is classified as cta_match.
 _CTA_REPLY_PATTERNS = frozenset({
-    "berminat", "nak", "mahu", "want", "interested", "yes please",
+    "berminat", "minat", "nak", "mahu", "want", "interested", "yes please",
     "boleh", "can", "ok", "okay", "yes", "ya", "setuju",
     "dm saya", "pm", "message me", "link please", "send link",
     "share link", "beri link", "hantar link",
