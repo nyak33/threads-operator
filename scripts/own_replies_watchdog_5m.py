@@ -292,6 +292,7 @@ def main() -> int:
     print(json.dumps({
         "new_replies": payload.get("new_replies", 0) if payload else 0,
         "proposed": payload.get("proposed_count", 0) if payload else 0,
+        "classified_backfill": payload.get("classified_backfill", 0) if payload else 0,
         "published": pub.get("posted", 0) if pub else 0,
         "failed": pub.get("failed", 0) if pub else 0,
         "dm_drafted": dm.get("dm_drafted", 0),
