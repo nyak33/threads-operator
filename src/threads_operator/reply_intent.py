@@ -227,6 +227,7 @@ def classify_reply_intent(
     positive_matches = _match_patterns(text_lower, _POSITIVE_PATTERNS)
     objection_matches = _match_patterns(text_lower, _OBJECTION_PATTERNS)
     buying_matches = _match_patterns(text_lower, _BUYING_PATTERNS)
+    cta_reply_matches = _match_patterns(text_lower, _CTA_REPLY_PATTERNS)
     cta_match = _is_cta_match(text, post_cta, cta_patterns)
 
     # Check for prior interactions (contextual evidence)
@@ -262,7 +263,7 @@ def classify_reply_intent(
             return IntentClassification(
                 intent=INTENT_CTA_MATCH,
                 evidence=IntentEvidence(
-                    matched_patterns=tuple(ambiguous_matches + ["cta_match"]),
+                    matched_patterns=tuple(dict.fromkeys(ambiguous_matches + cta_reply_matches + ["cta_match"])),
                     evidence_type="composite",
                     confidence=0.6,
                     notes=(
@@ -280,7 +281,7 @@ def classify_reply_intent(
             return IntentClassification(
                 intent=INTENT_CTA_MATCH,
                 evidence=IntentEvidence(
-                    matched_patterns=tuple(["cta_match"]),
+                    matched_patterns=tuple(dict.fromkeys(cta_reply_matches + ["cta_match"])),
                     evidence_type="keyword",
                     confidence=0.7,
                     notes=("cta_pattern_matched",),
