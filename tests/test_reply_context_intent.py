@@ -445,6 +445,17 @@ class TestIntentClassification:
         # "nak try" matches buying patterns, "boleh" matches CTA patterns
         # Composite: buying + CTA = potential_lead
         assert result.intent in (reply_intent.INTENT_CTA_MATCH, reply_intent.INTENT_BUYING, reply_intent.INTENT_POTENTIAL_LEAD)
+
+    def test_classify_cta_match_natural_minat_variant(self):
+        context = self._make_context(reply_text="Minat")
+        result = reply_intent.classify_reply_intent(
+            context=context,
+            reply_text="Minat",
+            post_cta="Komen berminat, nanti saya DM",
+            cta_patterns=("berminat",),
+        )
+        assert result.intent == reply_intent.INTENT_CTA_MATCH
+        assert "minat" in result.evidence.matched_patterns
         assert result.dm_opportunity is True
 
     # Test 5: ambiguous reply
