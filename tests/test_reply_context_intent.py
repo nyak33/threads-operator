@@ -456,6 +456,29 @@ class TestIntentClassification:
         )
         assert result.intent == reply_intent.INTENT_CTA_MATCH
         assert "minat" in result.evidence.matched_patterns
+
+
+    def test_generic_cta_word_without_post_cta_does_not_create_dm(self):
+        context = self._make_context(reply_text="Boleh juga")
+        result = reply_intent.classify_reply_intent(
+            context=context,
+            reply_text="Boleh juga",
+            post_cta=None,
+            cta_patterns=(),
+        )
+        assert result.intent != reply_intent.INTENT_CTA_MATCH
+        assert reply_intent.should_create_dm_opportunity(result) is False
+
+    def test_reply_keyword_must_align_with_actual_post_cta(self):
+        context = self._make_context(reply_text="Boleh cuba LokalFlow")
+        result = reply_intent.classify_reply_intent(
+            context=context,
+            reply_text="Boleh cuba LokalFlow",
+            post_cta="Korang rasa seller akan berminat tak?",
+            cta_patterns=(),
+        )
+        assert result.intent != reply_intent.INTENT_CTA_MATCH
+        assert reply_intent.should_create_dm_opportunity(result) is False
         assert result.dm_opportunity is True
 
     # Test 5: ambiguous reply
